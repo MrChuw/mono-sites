@@ -36,7 +36,6 @@ type CloudflareMetadata struct {
 	IP      string
 	Country string
 	UA      string
-	City    string
 }
 
 func CloudflareMiddleware(next http.Handler) http.Handler {
@@ -44,7 +43,6 @@ func CloudflareMiddleware(next http.Handler) http.Handler {
 		cf := CloudflareMetadata{
 			IP:      r.Header.Get("CF-Connecting-IP"),
 			Country: r.Header.Get("CF-IPCountry"),
-			City:    r.Header.Get("CF-IPCity"),
 			UA:      r.Header.Get("User-Agent"),
 		}
 		if cf.IP == "" {
