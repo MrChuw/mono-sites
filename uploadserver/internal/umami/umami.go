@@ -24,6 +24,7 @@ type UmamiPayload struct {
 		Hostname string                 `json:"hostname,omitempty"`
 		Referrer string                 `json:"referrer,omitempty"`
 		Data     map[string]interface{} `json:"data,omitempty"`
+		IP       string 				`json:"ip,omitempty"`
 	} `json:"payload"`
 	Type string `json:"type"`
 }
@@ -83,6 +84,7 @@ func (t *Umami) TrackPageViewAsync(r *http.Request, pageTitle, url string) {
 		data.Payload.Title = pageTitle
 		data.Payload.Hostname = t.hostname
 		data.Payload.Referrer = referrer
+		data.Payload.IP = ipAddress
 
 		jsonData, err := json.Marshal(data)
 		if err != nil {
@@ -148,6 +150,7 @@ func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, c
 		data.Payload.Hostname = t.hostname
 		data.Payload.Referrer = referrer
 		data.Payload.Data = customData
+		data.Payload.IP = ipAddress
 
 		jsonData, err := json.Marshal(data)
 		if err != nil {
@@ -301,6 +304,7 @@ const (
 type CloudflareMetadata struct {
 	IP      string
 	Country string
+	City    string
 	UA      string
 }
 
