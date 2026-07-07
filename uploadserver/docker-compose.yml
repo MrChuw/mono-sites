@@ -15,9 +15,9 @@ services:
             - UMAMI_WEBSITE_ID=${UMAMI_WEBSITE_ID:-}
             - UMAMI_HOSTNAME=${UMAMI_HOSTNAME:-}
             - MAX_NAME_LENGTH=${MAX_NAME_LENGTH:-64}
-            - PORT=&{PORT=-8000}
-            - PROXY=&{PROXY=-i}
-            - CDN=&{CDN=-im}
+            - PORT=${PORT:-8000}
+            - PROXY=${PROXY:-i}
+            - CDN=${CDN:-im}
         volumes:
             - ${PWD}/uploads:/app/uploads
             - ./db:/app/db

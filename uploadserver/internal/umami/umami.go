@@ -61,9 +61,15 @@ func (t *Umami) TrackPageViewAsync(r *http.Request, pageTitle, url string) {
 	acceptLang := r.Header.Get("Accept-Language")
 	referrer := r.Referer()
 
-	ipAddress := r.Header.Get("X-Forwarded-For")
-	if ipAddress == "" {
-		ipAddress = r.RemoteAddr
+	cfMetadata, ok := getCloudflareFromContext(r.Context())
+	var ipAddress string
+	if ok {
+	    ipAddress = cfMetadata.IP
+	} else {
+	    ipAddress = r.Header.Get("X-Forwarded-For")
+	    if ipAddress == "" {
+	        ipAddress = r.RemoteAddr
+	    }
 	}
 
 	go func() {
@@ -118,9 +124,15 @@ func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, c
 	acceptLang := r.Header.Get("Accept-Language")
 	referrer := r.Referer()
 
-	ipAddress := r.Header.Get("X-Forwarded-For")
-	if ipAddress == "" {
-		ipAddress = r.RemoteAddr
+	cfMetadata, ok := getCloudflareFromContext(r.Context())
+	var ipAddress string
+	if ok {
+	    ipAddress = cfMetadata.IP
+	} else {
+	    ipAddress = r.Header.Get("X-Forwarded-For")
+	    if ipAddress == "" {
+	        ipAddress = r.RemoteAddr
+	    }
 	}
 
 	go func() {
@@ -278,4 +290,25 @@ func getDeterministicUserAgent(userAgent, owner string) string {
 	default:
 		return fmt.Sprintf(templates[4], 0+versionModifier, 0+versionModifier)
 	}
+}
+
+type contextKey string
+
+const (
+	cloudflareKey    contextKey = "cloudflare"
+)
+
+type CloudflareMetadata struct {
+	IP      string
+	Country string
+	UA      string
+}
+
+func getCloudflareFromContext(ctx context.Context) (CloudflareMetadata, bool) {
+	val := ctx.Value(cloudflareKey)
+	if val == nil {
+		return CloudflareMetadata{}, false
+	}
+	cf, ok := val.(CloudflareMetadata)
+	return cf, ok
 }
