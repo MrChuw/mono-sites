@@ -8,9 +8,10 @@ services:
             - FORWARDED_PROTO=${FORWARDED_PROTO:-}
             - UPLOAD_DIR=${UPLOAD_DIR:-/app/uploads}
             - TRASH_DIR=${TRASH_DIR:-/app/uploads/.trash}
+            - THUMB_DIR=${THUMB_DIR:-/app/uploads/preview}
             - DEFAULT_MAX_UPLOAD_SIZE=${DEFAULT_MAX_UPLOAD_SIZE:-104857600}
             - INITIAL_TOKEN_LENGTH=${INITIAL_TOKEN_LENGTH:-5}
-            - RESERVED_NAMES=${RESERVED_NAMES:-api,static,assets,metrics,admin}
+            - RESERVED_NAMES=${RESERVED_NAMES:-api,static,assets,metrics,admin,preview}
             - UMAMI_URL_BASE=${UMAMI_URL_BASE:-}
             - UMAMI_WEBSITE_ID=${UMAMI_WEBSITE_ID:-}
             - UMAMI_HOSTNAME=${UMAMI_HOSTNAME:-}

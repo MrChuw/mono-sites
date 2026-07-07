@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 	"log"
-	"os/exec"
 
 	"gorm.io/gorm"
 	"uploadserver/internal/config"
@@ -74,21 +73,6 @@ func ParseTimeRange(from, to string, days int) (map[string]interface{}, error) {
 		}
 	}
 	return filters, nil
-}
-
-func StripAllMetadata(path string) error {
-	cmd := exec.Command(
-		"exiftool",
-		"-all=",
-		"-overwrite_original",
-		path,
-	)
-
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("exiftool: %w: %s", err, output)
-	}
-
-	return nil
 }
 
 func ExecuteFileDeletion(client *gorm.DB, file *db.UploadedFile) error {
@@ -155,6 +139,7 @@ func PurgeTrashOnStartup(client *gorm.DB) error {
 }
 
 func StartBackgroundTasks(client *gorm.DB) {
+	startPreviewWorkers(client, 3)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -200,4 +185,28 @@ func runPurge(client *gorm.DB) {
 			log.Printf("Error updating log status for ID %d: %v", entry.ID, err)
 		}
 	}
+}
+
+func startPreviewWorkers(client *gorm.DB, numWorkers int) {
+    for i := 0; i < numWorkers; i++ {
+        go func() {
+            for job := range PreviewQueue {
+                jobWg.Add(1)
+                func(j PreviewJob) {
+                    defer jobWg.Done()
+                    log.Printf("Processing preview job for file %s (attempt %d)", j.FileID, j.RetryCount)
+                    err := ProcessPreviewJob(client, j)
+                    if err != nil {
+                        if j.RetryCount < 3 {
+                            j.RetryCount++
+                            time.Sleep(time.Duration(j.RetryCount*10) * time.Second)
+                            PreviewQueue <- j
+                        } else {
+                            log.Printf("Preview job failed permanently for file %s: %v", j.FileID, err)
+                        }
+                    }
+                }(job)
+            }
+        }()
+    }
 }

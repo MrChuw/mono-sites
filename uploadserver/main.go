@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
+	"github.com/barasher/go-exiftool"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 
@@ -83,6 +84,14 @@ func startServer() {
 	if err := utils.PurgeTrashOnStartup(client); err != nil {
 		log.Printf("Startup purge error: %v", err)
 	}
+
+	utils.ExifDaemon, err = exiftool.NewExiftool(
+    	exiftool.ClearFieldsBeforeWriting(),
+	)
+	if err != nil {
+		log.Fatalf("Failed to start exiftool daemon: %v", err)
+	}
+	defer utils.ExifDaemon.Close()
 
 	utils.StartBackgroundTasks(client)
 

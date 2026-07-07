@@ -47,6 +47,12 @@ type UploadedFile struct {
 	APIKeyID uint
 	APIKey   APIKey `gorm:"foreignKey:APIKeyID;constraint:OnDelete:RESTRICT"`
 	Tags     []Tag  `gorm:"many2many:file_tags"`
+
+ 	ThumbnailPath string `gorm:"size:512;null"`
+    PreviewGifPath string `gorm:"size:512;null"`
+
+    PreviewStatus string `gorm:"size:20;default:'pending'"`
+    PreviewError  string `gorm:"size:255;null"`
 }
 
 func (f *UploadedFile) BeforeCreate(tx *gorm.DB) error {

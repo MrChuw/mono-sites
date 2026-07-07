@@ -12,6 +12,7 @@ var (
 	DatabaseURL          string
 	UploadDir            string
 	TrashDir             string
+	ThumbDir     		 string
 	ForwardedProto       string
 	MaxNameLength        int
 	DefaultMaxUploadSize int64
@@ -29,8 +30,9 @@ func LoadConfig() {
 	BaseDir, _ = filepath.Abs(filepath.Dir(os.Args[0]))
 
 	DatabaseURL = getEnv("DATABASE_URL", "sqlite://../db/db.sqlite3")
-	UploadDir = getEnv("UPLOAD_DIR", "../uploads")
-	TrashDir = getEnv("TRASH_DIR", "../uploads/.trash")
+	UploadDir = getEnv("UPLOAD_DIR", "./uploads")
+	TrashDir = getEnv("TRASH_DIR", "./uploads/.trash")
+	ThumbDir = getEnv("THUMB_DIR", "./uploads/preview")
 	ForwardedProto = getEnv("FORWARDED_PROTO", "")
 	MaxNameLength = getEnvInt("MAX_NAME_LENGTH", 64)
 	DefaultMaxUploadSize = getEnvInt64("DEFAULT_MAX_UPLOAD_SIZE", 100*1024*1024)
