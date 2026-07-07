@@ -1,0 +1,6 @@
+
+uploads/*
+db/*
+.db
+.env
+files_tests/
