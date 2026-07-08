@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"mime"
-	"log"
 
 	"gorm.io/gorm"
 
@@ -154,8 +153,6 @@ func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, inf
     if strings.Contains(cleanPath, "uploads/") {
         cleanPath = strings.SplitN(cleanPath, "uploads/", 2)[1]
     }
-    log.Printf("UploadDir: %s | FullPath: %s", config.UploadDir, fullPath)
-
 	webpURL := fmt.Sprintf("%s://%s/preview/w/%s.webp?chatterino", scheme, r.Host, baseName)
 	webpPath := filepath.Join(config.ThumbDir, "w", baseName+".webp")
 

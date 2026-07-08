@@ -27,11 +27,8 @@ func StripAllMetadata(path string, fileType string) error {
 	ExifDaemon.WriteMetadata(fileInfos)
 
 	if fileInfos[0].Err != nil {
-		err := fileInfos[0].Err
-		if strings.Contains(err.Error(), "not supported") || strings.Contains(err.Error(), "Unknown file") {
-			return fallbackReprocess(path, fileType)
-		}
-		return fmt.Errorf("exiftool daemon write error: %w", err)
+		log.Printf("[WARN] ExifTool failed to write metadata (%v). Triggering fallback...", fileInfos[0].Err)
+		return fallbackReprocess(path, fileType)
 	}
 
 	return nil
@@ -45,7 +42,9 @@ func fallbackReprocess(path string, fileType string) error {
 	}
 
 	if strings.HasPrefix(fileType, "image/") {
-		tmpPath := path + ".tmp.vips"
+		ext := filepath.Ext(path)
+		tmpPath := path + ".tmp" + ext
+
 		cmd := exec.Command("vips", "copy", path, tmpPath+"[strip=true]")
 		if err := cmd.Run(); err != nil {
 			os.Remove(tmpPath)
