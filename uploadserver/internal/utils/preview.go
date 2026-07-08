@@ -144,7 +144,7 @@ func processVideoPreview(client *gorm.DB, file *db.UploadedFile) error {
     webpPath := filepath.Join(filepath.Join(config.ThumbDir, "w"), baseName+".webp")
     if err := os.MkdirAll(filepath.Dir(webpPath), 0755); err == nil {
         cmdWebp := exec.Command("ffmpeg", "-y", "-i", file.SavedPath,
-            "-vf", "fps=1,scale=320:-2:flags=lanczos",
+            "-vf", "fps=5,scale=320:-2:flags=lanczos",
             "-c:v", "libwebp",
             "-q:v", "60",
             //"-t", "2",
