@@ -1,19 +1,25 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 
+	"github.com/barasher/go-exiftool"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
-	"github.com/barasher/go-exiftool"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
+
+	"database/sql"
+
+	"github.com/uptrace/bun"
+	"github.com/uptrace/bun/dialect/sqlitedialect"
+	"github.com/uptrace/bun/extra/bundebug"
+	_ "modernc.org/sqlite"
 
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
@@ -22,10 +28,9 @@ import (
 	"uploadserver/internal/utils"
 )
 
-
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using environment variables")
+		slog.Info("No .env file found, using environment variables")
 	}
 	config.LoadConfig()
 
@@ -61,39 +66,59 @@ func main() {
 }
 
 func startServer() {
-	if err := os.MkdirAll(config.UploadDir, 0755); err != nil {
-		log.Fatalf("Failed to create upload dir: %v", err)
+	utils.InitLogger(config.Environment)
+
+	dirs := []string{
+		config.UploadDir,
+		config.TrashDir,
+		config.ThumbDir,
+		filepath.Join(config.ThumbDir, "t"),
+		filepath.Join(config.ThumbDir, "p"),
+		filepath.Join(config.ThumbDir, "w"),
 	}
-	if err := os.MkdirAll(config.TrashDir, 0755); err != nil {
-		log.Fatalf("Failed to create trash dir: %v", err)
+
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			slog.Error("Failed to create directory", "path", dir, "error", err)
+			os.Exit(1)
+		}
 	}
 
 	umami.NewInstance()
 
-	client, err := initDB()
+	ctx := context.Background()
+	dbConn, err := initDB()
 	if err != nil {
-		log.Fatalf("Failed to connect database: %v", err)
+		slog.Error("Failed to connect database", "error", err)
+		os.Exit(1)
 	}
-	sqlDB, _ := client.DB()
-	defer sqlDB.Close()
+	defer dbConn.Close()
 
-	if err := client.AutoMigrate(&db.APIKey{}, &db.Tag{}, &db.UploadedFile{}, &db.DeletedFileLog{}); err != nil {
-		log.Fatalf("Migration failed: %v", err)
+	if err := db.MigrateDB(ctx, dbConn); err != nil {
+		slog.Error("Migration failed", "error", err)
+		os.Exit(1)
 	}
 
-	if err := utils.PurgeTrashOnStartup(client); err != nil {
-		log.Printf("Startup purge error: %v", err)
+	if config.Environment == "debug" {
+		dbConn.AddQueryHook(bundebug.NewQueryHook(
+			bundebug.WithVerbose(true),
+		))
+	}
+
+	if err := utils.PurgeTrashOnStartup(ctx, dbConn); err != nil {
+		slog.Error("Startup purge error", "error", err)
 	}
 
 	utils.ExifDaemon, err = exiftool.NewExiftool(
-    	exiftool.ClearFieldsBeforeWriting(),
+		exiftool.ClearFieldsBeforeWriting(),
 	)
 	if err != nil {
-		log.Fatalf("Failed to start exiftool daemon: %v", err)
+		slog.Error("Failed to start exiftool daemon", "error", err)
+		os.Exit(1)
 	}
 	defer utils.ExifDaemon.Close()
 
-	utils.StartBackgroundTasks(client)
+	utils.StartBackgroundTasks(ctx, dbConn)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -101,38 +126,39 @@ func startServer() {
 	r.Use(handlers.CloudflareMiddleware)
 
 	r.Get("/", handlers.RootHandler)
-	r.Get("/favicon.ico", handlers.FaviconHandler(client))
-	r.Get("/api/delete/{token}", handlers.DeleteFileHandler(client))
-	r.Get("/{file_path:.*}", handlers.ServeFileHandler(client))
-	// r.HandleFunc("/*", handlers.serveFileHandler(client))
+	r.Get("/favicon.ico", handlers.FaviconHandler(dbConn))
+	r.Get("/api/delete/{token}", handlers.DeleteFileHandler(dbConn))
+	r.Get("/{file_path:.*}", handlers.ServeFileHandler(dbConn))
+	// r.HandleFunc("/*", handlers.serveFileHandler(dbConn))
 
 	r.Route("/api", func(api chi.Router) {
-		api.Use(handlers.AuthMiddleware(client))
+		api.Use(handlers.AuthMiddleware(dbConn))
 
-		api.Post("/upload", handlers.UploadFileHandler(client, true))
-		api.Post("/uploaddoxx", handlers.UploadFileHandler(client, false))
-		// api.Get("/delete/{token}", handlers.deleteFileHandler(client))
-		api.Post("/keys", handlers.CreateKeyHandler(client))
-		api.Get("/metrics/user", handlers.GetUserMetricsHandler(client))
-		api.Get("/metrics/admin", handlers.GetAdminMetricsHandler(client))
-		api.Post("/sharex/config", handlers.SharexConfigHandler(client))
+		api.Post("/upload", handlers.UploadFileHandler(dbConn, true))
+		api.Post("/uploaddoxx", handlers.UploadFileHandler(dbConn, false))
+		// api.Get("/delete/{token}", handlers.deleteFileHandler(dbConn))
+		api.Post("/keys", handlers.CreateKeyHandler(dbConn))
+		api.Get("/metrics/user", handlers.GetUserMetricsHandler(dbConn))
+		api.Get("/metrics/admin", handlers.GetAdminMetricsHandler(dbConn))
+		api.Post("/sharex/config", handlers.SharexConfigHandler(dbConn))
 	})
 
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		handlers.ServeFileHandler(client)(w, r)
+		handlers.ServeFileHandler(dbConn)(w, r)
 	})
 
 	port := config.Port
 	if port == "" {
 		port = "8000"
 	}
-	log.Printf("Starting server on :%s", port)
+	slog.Info("Starting server", "port", port)
 	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatalf("Server failed: %v", err)
+		slog.Error("Server failed", "error", err)
+		os.Exit(1)
 	}
 }
 
-func initDB() (*gorm.DB, error) {
+func initDB() (*bun.DB, error) {
 	dbPath := config.DatabaseURL
 	if len(dbPath) > 10 && dbPath[:10] == "sqlite:///" {
 		dbPath = dbPath[10:]
@@ -142,7 +168,14 @@ func initDB() (*gorm.DB, error) {
 			return nil, err
 		}
 	}
-	return gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	db := bun.NewDB(sqldb, sqlitedialect.New())
+	return db, nil
 }
 
 func handleCreateKey(args []string) {
@@ -174,13 +207,13 @@ func handleCreateKey(args []string) {
 		fmt.Printf("Invalid role '%s', using normal.\n", *roleStr)
 	}
 
-	// Connect to DB to create the key
-	client, err := initDB()
+	dbConn, err := initDB()
 	if err != nil {
-		log.Fatalf("Failed to connect database: %v", err)
+		slog.Error("Failed to connect database", "error", err)
+		os.Exit(1)
 	}
-	sqlDB, _ := client.DB()
-	defer sqlDB.Close()
+	defer dbConn.Close()
+	ctx := context.Background()
 
 	key := "sk_" + utils.SecureRandomString(48)
 	var maxSize *int64
@@ -195,8 +228,12 @@ func handleCreateKey(args []string) {
 		Role:          role,
 		MaxUploadSize: maxSize,
 	}
-	if err := client.Create(&newKey).Error; err != nil {
-		log.Fatalf("Failed to create key: %v", err)
+	_, err = dbConn.NewInsert().
+		Model(&newKey).
+		Exec(ctx)
+	if err != nil {
+		slog.Error("Failed to create keye", "error", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf("\nAPI Key Created:\nOwner: %s\nRole: %s\nKey: %s\n\n", newKey.Owner, newKey.Role, newKey.Key)
@@ -220,7 +257,7 @@ Use "uploadserver [command] --help" for more information about a command.`)
 }
 
 func createKeyUsage() {
-		fmt.Println(`Create a new API key.
+	fmt.Println(`Create a new API key.
 
 Usage:
  uploadserver create-key --owner NAME [options]

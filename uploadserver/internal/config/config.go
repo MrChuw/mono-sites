@@ -1,3 +1,4 @@
+// Package config
 package config
 
 import (
@@ -12,7 +13,7 @@ var (
 	DatabaseURL          string
 	UploadDir            string
 	TrashDir             string
-	ThumbDir     		 string
+	ThumbDir             string
 	ForwardedProto       string
 	MaxNameLength        int
 	DefaultMaxUploadSize int64
@@ -21,9 +22,10 @@ var (
 	UmamiURLBase         string
 	UmamiWebsiteID       string
 	UmamiHostname        string
-	Port 				 string
-	Proxy				 string
-	Cdn					 string
+	Port                 string
+	Proxy                string
+	Cdn                  string
+	Environment          string
 )
 
 func LoadConfig() {
@@ -43,6 +45,7 @@ func LoadConfig() {
 	Port = getEnv("PORT", "")
 	Proxy = getEnv("PROXY", "i")
 	Cdn = getEnv("CDN", "im")
+	Environment = getEnv("ENVIRONMENT", "verbose")
 
 	reserved := getEnv("RESERVED_NAMES", "api,static,assets")
 	ReservedNames = make(map[string]bool)

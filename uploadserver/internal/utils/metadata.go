@@ -2,11 +2,11 @@ package utils
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
-	"strings"
 	"path/filepath"
+	"strings"
 
 	"github.com/barasher/go-exiftool"
 )
@@ -23,11 +23,11 @@ func StripAllMetadata(path string, fileType string) error {
 		return fallbackReprocess(path, fileType)
 	}
 
-	fileInfos[0].Fields = make(map[string]interface{})
+	fileInfos[0].Fields = make(map[string]any)
 	ExifDaemon.WriteMetadata(fileInfos)
 
 	if fileInfos[0].Err != nil {
-		log.Printf("[WARN] ExifTool failed to write metadata (%v). Triggering fallback...", fileInfos[0].Err)
+		slog.Warn("ExifTool failed to write metadata, triggering fallback", "error", fileInfos[0].Err, "path", path)
 		return fallbackReprocess(path, fileType)
 	}
 
@@ -35,7 +35,7 @@ func StripAllMetadata(path string, fileType string) error {
 }
 
 func fallbackReprocess(path string, fileType string) error {
-	log.Printf("Fallback processing for: %s", fileType)
+	slog.Info("Fallback processing initiated", "file_type", fileType, "path", path)
 
 	if fileType == "application/octet-stream" {
 		return nil

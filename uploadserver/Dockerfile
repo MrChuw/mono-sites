@@ -1,8 +1,8 @@
-FROM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+
+ARG TARGETARCH
 
 WORKDIR /app
-
-RUN apk add --no-cache gcc musl-dev sqlite-dev
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -11,12 +11,11 @@ COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=1 GOOS=linux \
-    go build \
-    -ldflags="-s -w" \
-    -o uploadserver .
+    CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+    go build -ldflags="-s -w" -o uploadserver .
 
-FROM alpine:3.24.1
+ARG TARGETPLATFORM
+FROM --platform=$TARGETPLATFORM alpine:3.24.1
 
 WORKDIR /app
 

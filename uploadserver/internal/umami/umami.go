@@ -1,15 +1,16 @@
+// Package umami
 package umami
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
-	"time"
-	"strings"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/http"
+	"strings"
+	"time"
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
 )
@@ -18,14 +19,14 @@ var Instance *Umami
 
 type UmamiPayload struct {
 	Payload struct {
-		Website  string                 `json:"website"`
-		URL      string                 `json:"url"`
-		Title    string                 `json:"title,omitempty"`
-		Name     string                 `json:"name,omitempty"`
-		Hostname string                 `json:"hostname,omitempty"`
-		Referrer string                 `json:"referrer,omitempty"`
-		Data     map[string]interface{} `json:"data,omitempty"`
-		IP       string 				`json:"ip,omitempty"`
+		Website  string         `json:"website"`
+		URL      string         `json:"url"`
+		Title    string         `json:"title,omitempty"`
+		Name     string         `json:"name,omitempty"`
+		Hostname string         `json:"hostname,omitempty"`
+		Referrer string         `json:"referrer,omitempty"`
+		Data     map[string]any `json:"data,omitempty"`
+		IP       string         `json:"ip,omitempty"`
 	} `json:"payload"`
 	Type string `json:"type"`
 }
@@ -40,7 +41,7 @@ type Umami struct {
 
 func NewInstance() *Umami {
 	if config.UmamiURLBase == "" || config.UmamiWebsiteID == "" || config.UmamiHostname == "" {
-		log.Println("⚠️ Umami tracking disabled (missing config variables)")
+		slog.Warn("Umami tracking disabled (missing config variables)")
 		return &Umami{enabled: false}
 	}
 
@@ -65,17 +66,17 @@ func (t *Umami) TrackPageViewAsync(r *http.Request, pageTitle, url string) {
 
 	ipAddress := r.Header.Get("CF-Connecting-IP")
 	if ipAddress == "" {
-	    ipAddress = r.Header.Get("X-Forwarded-For")
-	    if ipAddress != "" {
-	        ips := strings.Split(ipAddress, ",")
-	        ipAddress = strings.TrimSpace(ips[0])
-	    }
+		ipAddress = r.Header.Get("X-Forwarded-For")
+		if ipAddress != "" {
+			ips := strings.Split(ipAddress, ",")
+			ipAddress = strings.TrimSpace(ips[0])
+		}
 	}
 	if ipAddress == "" {
-	    ipAddress = r.RemoteAddr
-	    if host, _, err := net.SplitHostPort(ipAddress); err == nil {
-	        ipAddress = host
-	    }
+		ipAddress = r.RemoteAddr
+		if host, _, err := net.SplitHostPort(ipAddress); err == nil {
+			ipAddress = host
+		}
 	}
 
 	go func() {
@@ -93,13 +94,13 @@ func (t *Umami) TrackPageViewAsync(r *http.Request, pageTitle, url string) {
 
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			log.Printf("❌ Umami marshal error: %v", err)
+			slog.Error("Umami marshal error", "error", err)
 			return
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", t.apiEndpoint, bytes.NewBuffer(jsonData))
 		if err != nil {
-			log.Printf("❌ Umami request creation error: %v", err)
+			slog.Error("Umami request creation error", "error", err)
 			return
 		}
 
@@ -109,18 +110,18 @@ func (t *Umami) TrackPageViewAsync(r *http.Request, pageTitle, url string) {
 
 		resp, err := t.httpClient.Do(req)
 		if err != nil {
-			log.Printf("❌ Umami send error: %v", err)
+			slog.Error("Umami send error", "error", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("⚠️ Umami returned status: %d", resp.StatusCode)
+			slog.Warn("Umami returned unexpected status", "status", resp.StatusCode)
 		}
 	}()
 }
 
-func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, customData map[string]interface{}) {
+func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, customData map[string]any) {
 	if !t.enabled {
 		return
 	}
@@ -132,17 +133,17 @@ func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, c
 
 	ipAddress := r.Header.Get("CF-Connecting-IP")
 	if ipAddress == "" {
-	    ipAddress = r.Header.Get("X-Forwarded-For")
-	    if ipAddress != "" {
-	        ips := strings.Split(ipAddress, ",")
-	        ipAddress = strings.TrimSpace(ips[0])
-	    }
+		ipAddress = r.Header.Get("X-Forwarded-For")
+		if ipAddress != "" {
+			ips := strings.Split(ipAddress, ",")
+			ipAddress = strings.TrimSpace(ips[0])
+		}
 	}
 	if ipAddress == "" {
-	    ipAddress = r.RemoteAddr
-	    if host, _, err := net.SplitHostPort(ipAddress); err == nil {
-	        ipAddress = host
-	    }
+		ipAddress = r.RemoteAddr
+		if host, _, err := net.SplitHostPort(ipAddress); err == nil {
+			ipAddress = host
+		}
 	}
 
 	go func() {
@@ -162,13 +163,13 @@ func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, c
 
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			log.Printf("❌ Umami marshal error: %v", err)
+			slog.Error("Umami marshal error", "error", err)
 			return
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", t.apiEndpoint, bytes.NewBuffer(jsonData))
 		if err != nil {
-			log.Printf("❌ Umami request creation error: %v", err)
+			slog.Error("Umami request creation error", "error", err)
 			return
 		}
 
@@ -178,21 +179,21 @@ func (t *Umami) TrackEventAsync(r *http.Request, eventName, title, url string, c
 
 		resp, err := t.httpClient.Do(req)
 		if err != nil {
-			log.Printf("❌ Umami send error: %v", err)
+			slog.Error("Umami send error", "error", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			log.Printf("⚠️ Umami returned status: %d", resp.StatusCode)
+			slog.Warn("Umami returned unexpected status", "status", resp.StatusCode)
 		}
 	}()
 }
 
-type UmamiDataOption func(map[string]interface{})
+type UmamiDataOption func(map[string]any)
 
-func BuildUmamiData(r *http.Request, owner string, opts ...UmamiDataOption) map[string]interface{} {
-	data := make(map[string]interface{})
+func BuildUmamiData(r *http.Request, owner string, opts ...UmamiDataOption) map[string]any {
+	data := make(map[string]any)
 
 	if owner != "" {
 		data["owner"] = owner
@@ -209,7 +210,7 @@ func BuildUmamiData(r *http.Request, owner string, opts ...UmamiDataOption) map[
 }
 
 func WithUploadMeta(r *http.Request) UmamiDataOption {
-	return func(data map[string]interface{}) {
+	return func(data map[string]any) {
 		if scope := r.Header.Get("X-Name"); scope != "" {
 			data["scope"] = scope
 		}
@@ -220,7 +221,7 @@ func WithUploadMeta(r *http.Request) UmamiDataOption {
 }
 
 func WithFilename(name string) UmamiDataOption {
-	return func(data map[string]interface{}) {
+	return func(data map[string]any) {
 		if name != "" {
 			data["filename"] = name
 		}
@@ -228,7 +229,7 @@ func WithFilename(name string) UmamiDataOption {
 }
 
 func WithUploadedAt(t time.Time) UmamiDataOption {
-	return func(data map[string]interface{}) {
+	return func(data map[string]any) {
 		if !t.IsZero() {
 			data["uploaded_at"] = t.Format(time.RFC3339)
 		}
@@ -236,7 +237,7 @@ func WithUploadedAt(t time.Time) UmamiDataOption {
 }
 
 func WithNewOwner(owner string) UmamiDataOption {
-	return func(data map[string]interface{}) {
+	return func(data map[string]any) {
 		if owner != "" {
 			data["new_owner"] = owner
 		}
@@ -244,7 +245,7 @@ func WithNewOwner(owner string) UmamiDataOption {
 }
 
 func WithNewRole(role db.UserRole) UmamiDataOption {
-	return func(data map[string]interface{}) {
+	return func(data map[string]any) {
 		if role != "" {
 			data["new_role"] = string(role)
 		}
@@ -252,7 +253,7 @@ func WithNewRole(role db.UserRole) UmamiDataOption {
 }
 
 func WithCreatedBy(creator string) UmamiDataOption {
-	return func(data map[string]interface{}) {
+	return func(data map[string]any) {
 		if creator != "" {
 			data["created_by"] = creator
 		}
@@ -263,9 +264,9 @@ func getDeterministicUserAgent(userAgent, owner string) string {
 	uaLower := strings.ToLower(userAgent)
 
 	if userAgent != "" &&
-	   !strings.Contains(uaLower, "curl") &&
-	   !strings.Contains(uaLower, "postman") &&
-	   !strings.Contains(uaLower, "go-http-client") {
+		!strings.Contains(uaLower, "curl") &&
+		!strings.Contains(uaLower, "postman") &&
+		!strings.Contains(uaLower, "go-http-client") {
 		return userAgent
 	}
 

@@ -1,23 +1,22 @@
 package handlers
 
 import (
-	"regexp"
 	"fmt"
-	"net/http"
 	"html"
+	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"mime"
 
-	"gorm.io/gorm"
+	"github.com/uptrace/bun"
 
 	"uploadserver/internal/config"
 	"uploadserver/internal/umami"
 )
 
-
-func ServeFileHandler(client *gorm.DB) http.HandlerFunc {
+func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filePath := strings.TrimPrefix(r.URL.Path, "/")
 		filePath = strings.TrimLeft(filepath.ToSlash(filePath), "/")
@@ -59,10 +58,10 @@ func ServeFileHandler(client *gorm.DB) http.HandlerFunc {
 
 		isPreview := strings.Contains(r.URL.Path, "/preview/")
 
-        if !isPreview && isLinkResolver(r.Header.Get("User-Agent")) {
-            serveOpenGraph(w, r, fullPath, info)
-            return
-        }
+		if !isPreview && isLinkResolver(r.Header.Get("User-Agent")) {
+			serveOpenGraph(w, r, fullPath, info)
+			return
+		}
 
 		hostType := r.Header.Get("X-Host-Type")
 
@@ -84,8 +83,8 @@ func ServeFileHandler(client *gorm.DB) http.HandlerFunc {
 		etag := fmt.Sprintf(`"%d-%d"`, info.ModTime().Unix(), info.Size())
 
 		if strings.Contains(r.URL.Path, "/preview/") {
-		    w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
-		    w.Header().Set("Vary", "Origin")
+			w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
+			w.Header().Set("Vary", "Origin")
 		} else {
 			w.Header().Set("Cache-Control", "public, max-age=300, immutable")
 		}
@@ -94,9 +93,9 @@ func ServeFileHandler(client *gorm.DB) http.HandlerFunc {
 		mime := mime.TypeByExtension(strings.ToLower(filepath.Ext(fullPath)))
 
 		if strings.HasPrefix(mime, "text/html") ||
-		    mime == "image/svg+xml" ||
-		    mime == "application/xhtml+xml" {
-		    w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+			mime == "image/svg+xml" ||
+			mime == "application/xhtml+xml" {
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 		}
 
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -111,7 +110,6 @@ func ServeFileHandler(client *gorm.DB) http.HandlerFunc {
 	}
 }
 
-
 var linkResolvers = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)chatterino-api-cache/\d+\.\d+\.\d+ link-resolver`),
 	// regexp.MustCompile(`(?i)discordbot/\d+\.\d+`),
@@ -125,7 +123,6 @@ func isLinkResolver(userAgent string) bool {
 	}
 	return false
 }
-
 
 func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, info os.FileInfo) {
 	baseName := strings.TrimSuffix(filepath.Base(fullPath), filepath.Ext(fullPath))
@@ -145,14 +142,14 @@ func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, inf
 		}
 	}
 	relPath, err := filepath.Rel(config.UploadDir, fullPath)
-    if err != nil {
-        relPath = filepath.Base(fullPath)
-    }
+	if err != nil {
+		relPath = filepath.Base(fullPath)
+	}
 
-    cleanPath := filepath.ToSlash(relPath)
-    if strings.Contains(cleanPath, "uploads/") {
-        cleanPath = strings.SplitN(cleanPath, "uploads/", 2)[1]
-    }
+	cleanPath := filepath.ToSlash(relPath)
+	if strings.Contains(cleanPath, "uploads/") {
+		cleanPath = strings.SplitN(cleanPath, "uploads/", 2)[1]
+	}
 	webpURL := fmt.Sprintf("%s://%s/preview/w/%s.webp?chatterino", scheme, r.Host, baseName)
 	webpPath := filepath.Join(config.ThumbDir, "w", baseName+".webp")
 
@@ -195,10 +192,10 @@ func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, inf
 </html>`, titleEscaped, imageEscaped, descEscaped, videoTags, scheme, r.Host, cleanPath)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-    w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate")
-    w.Header().Set("Pragma", "no-cache")
-    w.Header().Set("Expires", "0")
-    w.Header().Set("Vary", "*")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+	w.Header().Set("Vary", "*")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(htmlContent))
 }

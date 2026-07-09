@@ -1,159 +1,148 @@
 package utils
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"log"
 	"sync"
-	"net/http"
-	"os/exec"
-	"fmt"
 
-	"gorm.io/gorm"
+	"github.com/uptrace/bun"
 
-	"uploadserver/internal/db"
 	"uploadserver/internal/config"
+	"uploadserver/internal/db"
 )
 
 type PreviewJob struct {
-    FileID string
-    RetryCount int
+	FileID     string
+	RetryCount int
 }
 
 var (
-    PreviewQueue = make(chan PreviewJob, 100)
-    jobWg        sync.WaitGroup
+	PreviewQueue = make(chan PreviewJob, 100)
+	jobWg        sync.WaitGroup
 )
-
-func EnqueuePreviewJob(fileID string) {
-    select {
-    case PreviewQueue <- PreviewJob{FileID: fileID}:
-    default:
-        log.Printf("Preview queue full, dropping job for file %s", fileID)
-    }
-}
-
-func ProcessPreviewJob(client *gorm.DB, job PreviewJob) error {
-    var file db.UploadedFile
-    if err := client.Preload("APIKey").First(&file, "id = ?", job.FileID).Error; err != nil {
-        return err
-    }
-
-    if file.PreviewStatus == "done" {
-        return nil
-    }
-
-    client.Model(&file).Update("preview_status", "processing")
-
-    f, err := os.Open(file.SavedPath)
-    if err != nil {
-        client.Model(&file).Updates(map[string]interface{}{"preview_status": "error", "preview_error": err.Error()})
-        return err
-    }
-    defer f.Close()
-
-    buffer := make([]byte, 512)
-    if _, err := f.Read(buffer); err != nil {
-        client.Model(&file).Updates(map[string]interface{}{"preview_status": "error", "preview_error": err.Error()})
-        return err
-    }
-    mimeType := http.DetectContentType(buffer)
-
-    if mimeType == "application/octet-stream" {
-            ext := strings.ToLower(filepath.Ext(file.SavedPath))
-            switch ext {
-            case ".jxl":
-                mimeType = "image/jxl"
-            case ".avif":
-                mimeType = "image/avif"
-            }
-        }
-
-    if strings.HasPrefix(mimeType, "image/") {
-        return processImagePreview(client, &file)
-    } else if strings.HasPrefix(mimeType, "video/") {
-        return processVideoPreview(client, &file)
-    } else {
-        client.Model(&file).Update("preview_status", "skipped")
-        return nil
-    }
-}
 
 var (
-	targetSizeMB    	    = 3.9
-	minTargetSizeMB 	    = 3.5
-	initialDim              = 3000
-	minDim                  = 400
-	initialQuality          = 95
-	minQuality              = 10
-	qualityStep             = 10
-	dimReduceFactor         = 0.85
+	targetSizeMB    = 3.9
+	minTargetSizeMB = 3.5
+	initialDim      = 3000
+	minDim          = 400
+	initialQuality  = 95
+	minQuality      = 10
+	qualityStep     = 10
+	dimReduceFactor = 0.85
 )
-
 
 var (
 	maxSizeBytes int64 = int64(targetSizeMB * 1024 * 1024)
 	minSizeBytes int64 = int64(minTargetSizeMB * 1024 * 1024)
 )
 
-func processImagePreview(client *gorm.DB, file *db.UploadedFile) error {
-    baseName := strings.TrimSuffix(filepath.Base(file.SavedPath), filepath.Ext(file.SavedPath))
-    thumbDir := filepath.Join(config.ThumbDir, "t")
-    if err := os.MkdirAll(thumbDir, 0755); err != nil {
-        errMsg := fmt.Sprintf("mkdir failed: %v", err)
-        client.Model(file).Updates(map[string]interface{}{
-            "preview_status": "error",
-            "preview_error":  errMsg,
-        })
-        return err
-    }
+func EnqueuePreviewJob(fileID string) {
+	select {
+	case PreviewQueue <- PreviewJob{FileID: fileID}:
+	default:
+		slog.Warn("Preview queue full, dropping job", "file_id", fileID)
+	}
+}
 
-    fileInfo, err := os.Stat(file.SavedPath)
-    if err != nil {
-        errMsg := fmt.Sprintf("failed to stat original file: %v", err)
-        client.Model(file).Updates(map[string]interface{}{
-            "preview_status": "error",
-            "preview_error":  errMsg,
-        })
-        return err
-    }
+func ProcessPreviewJob(ctx context.Context, client *bun.DB, job PreviewJob) error {
+	file, err := db.GetUploadedFileByID(ctx, client, job.FileID)
+	if err != nil {
+		return err
+	}
 
-    // fmt.Printf("[INFO] Original file size: %d bytes (Limit: %d bytes)\n", fileInfo.Size(), maxSizeBytes)
+	if file.PreviewStatus == "done" {
+		return nil
+	}
 
-    var finalThumbPath string
-    if fileInfo.Size() <= maxSizeBytes {
-        // fmt.Println("[INFO] Original image is already within target size. Generating preview file...")
-        finalThumbPath = filepath.Join(thumbDir, baseName+".jpg")
-        os.Remove(finalThumbPath)
-        outputParams := fmt.Sprintf("%s[Q=%d,optimize_coding=true]", finalThumbPath, initialQuality)
-        cmd := exec.Command("vips", "copy", file.SavedPath, outputParams)
+	if err := db.UpdateFilePreview(ctx, client, file.ID, "processing", "", nil); err != nil {
+		return err
+	}
 
-        if out, err := cmd.CombinedOutput(); err != nil {
-            errMsg := fmt.Sprintf("failed to generate preview for small file: %v, output: %s", err, string(out))
-            client.Model(file).Updates(map[string]interface{}{
-                "preview_status": "error",
-                "preview_error":  errMsg,
-            })
-            return err
-        }
-    } else {
-        // fmt.Println("[INFO] Original image exceeds target size. Initializing optimizer...")
-        finalThumbPath, err = optimizeImage(file.SavedPath, thumbDir, baseName)
-        if err != nil {
-            client.Model(file).Updates(map[string]interface{}{
-                "preview_status": "error",
-                "preview_error":  err.Error(),
-            })
-            return err
-        }
-    }
+	f, err := os.Open(file.SavedPath)
+	if err != nil {
+		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", err.Error(), nil)
+		return err
+	}
+	defer f.Close()
 
-    client.Model(file).Updates(map[string]interface{}{
-        "preview_status": "done",
-        "thumbnail_path": finalThumbPath,
-    })
-    return nil
+	buffer := make([]byte, 512)
+	if _, err := f.Read(buffer); err != nil {
+		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", err.Error(), nil)
+		return err
+	}
+	mimeType := http.DetectContentType(buffer)
+
+	if mimeType == "application/octet-stream" {
+		ext := strings.ToLower(filepath.Ext(file.SavedPath))
+		switch ext {
+		case ".jxl":
+			mimeType = "image/jxl"
+		case ".avif":
+			mimeType = "image/avif"
+		}
+	}
+
+	if strings.HasPrefix(mimeType, "image/") {
+		return processImagePreview(ctx, client, file)
+	} else if strings.HasPrefix(mimeType, "video/") {
+		return processVideoPreview(ctx, client, file)
+	} else {
+		return db.UpdateFilePreview(ctx, client, file.ID, "skipped", "", nil)
+	}
+}
+
+func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedFile) error {
+	baseName := strings.TrimSuffix(filepath.Base(file.SavedPath), filepath.Ext(file.SavedPath))
+	thumbDir := filepath.Join(config.ThumbDir, "t")
+	if err := os.MkdirAll(thumbDir, 0755); err != nil {
+		errMsg := fmt.Sprintf("mkdir failed: %v", err)
+		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", errMsg, nil)
+		return err
+	}
+
+	fileInfo, err := os.Stat(file.SavedPath)
+	if err != nil {
+		errMsg := fmt.Sprintf("failed to stat original file: %v", err)
+		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", errMsg, nil)
+		return err
+	}
+
+	slog.Debug("Original file size check", "file_id", file.ID, "size_bytes", fileInfo.Size(), "limit_bytes", maxSizeBytes)
+
+	var finalThumbPath string
+	if fileInfo.Size() <= maxSizeBytes {
+		slog.Debug("Original image is already within target size, generating preview file", "file_id", file.ID)
+		finalThumbPath = filepath.Join(thumbDir, baseName+".jpg")
+		os.Remove(finalThumbPath)
+		outputParams := fmt.Sprintf("%s[Q=%d,optimize_coding=true]", finalThumbPath, initialQuality)
+		cmd := exec.Command("vips", "copy", file.SavedPath, outputParams)
+
+		if out, err := cmd.CombinedOutput(); err != nil {
+			errMsg := fmt.Sprintf("failed to generate preview for small file: %v, output: %s", err, string(out))
+			_ = db.UpdateFilePreview(ctx, client, file.ID, "error", errMsg, nil)
+			return err
+		}
+	} else {
+		slog.Debug("Original image exceeds target size, initializing optimizer", "file_id", file.ID)
+
+		finalThumbPath, err = optimizeImage(file.SavedPath, thumbDir, baseName)
+		if err != nil {
+			_ = db.UpdateFilePreview(ctx, client, file.ID, "error", err.Error(), nil)
+			return err
+		}
+	}
+	fields := &db.PreviewFields{
+		ThumbnailPath: finalThumbPath,
+	}
+
+	return db.UpdateFilePreview(ctx, client, file.ID, "done", "", fields)
 }
 
 type tempTracker struct {
@@ -223,8 +212,10 @@ func optimizeImage(sourcePath, thumbDir, baseName string) (string, error) {
 		tracker.Track(minPath)
 
 		if minSize > maxSizeBytes {
-			os.Remove(maxPath); tracker.Untrack(maxPath)
-			os.Remove(minPath); tracker.Untrack(minPath)
+			os.Remove(maxPath)
+			tracker.Untrack(maxPath)
+			os.Remove(minPath)
+			tracker.Untrack(minPath)
 			scale *= dimReduceFactor
 			continue
 		}
@@ -255,16 +246,19 @@ func optimizeImage(sourcePath, thumbDir, baseName string) (string, error) {
 			if midSize < minSizeBytes {
 				if midSize > bestFallbackSize {
 					if bestFallbackPath != "" {
-						os.Remove(bestFallbackPath); tracker.Untrack(bestFallbackPath)
+						os.Remove(bestFallbackPath)
+						tracker.Untrack(bestFallbackPath)
 					}
 					bestFallbackPath = midPath
 					bestFallbackSize = midSize
 				} else {
-					os.Remove(midPath); tracker.Untrack(midPath)
+					os.Remove(midPath)
+					tracker.Untrack(midPath)
 				}
 				low = midQuality + 1
 			} else {
-				os.Remove(midPath); tracker.Untrack(midPath)
+				os.Remove(midPath)
+				tracker.Untrack(midPath)
 				high = midQuality - 1
 			}
 		}
@@ -274,7 +268,8 @@ func optimizeImage(sourcePath, thumbDir, baseName string) (string, error) {
 			return renameToFinal(bestFallbackPath, finalThumbPath)
 		}
 
-		os.Remove(maxPath); tracker.Untrack(maxPath)
+		os.Remove(maxPath)
+		tracker.Untrack(maxPath)
 		scale *= dimReduceFactor
 	}
 
@@ -312,85 +307,371 @@ func renameToFinal(tempPath, finalPath string) (string, error) {
 	return finalPath, nil
 }
 
+func processVideoPreview(ctx context.Context, client *bun.DB, file *db.UploadedFile) error {
+	baseName := strings.TrimSuffix(filepath.Base(file.SavedPath), filepath.Ext(file.SavedPath))
 
+	thumbDir := filepath.Join(config.ThumbDir, "t")
+	gifDir := filepath.Join(config.ThumbDir, "p")
+	webpDir := filepath.Join(config.ThumbDir, "w")
 
+	tempFramePath := filepath.Join(thumbDir, baseName+"_temp_frame.jpg")
 
+	cmdThumb := exec.Command("ffmpeg", "-y", "-ss", "00:00:05", "-i", file.SavedPath, "-q:v", "2", "-vframes", "1", tempFramePath)
+	if out, err := cmdThumb.CombinedOutput(); err != nil {
+		cmdThumb = exec.Command("ffmpeg", "-y", "-ss", "00:00:01", "-i", file.SavedPath, "-q:v", "2", "-vframes", "1", tempFramePath)
+		if _, err2 := cmdThumb.CombinedOutput(); err2 != nil {
+			slog.Error("Falha ao extrair frame temporário", "error", err, "output", string(out))
+			tempFramePath = ""
+		}
+	}
 
+	var thumbPath string
+	if tempFramePath != "" {
+		fi, err := os.Stat(tempFramePath)
+		if err == nil {
+			if fi.Size() <= maxSizeBytes {
+				thumbPath = filepath.Join(thumbDir, baseName+".jpg")
+				os.Remove(thumbPath)
 
+				outputParams := fmt.Sprintf("%s[Q=%d,optimize_coding=true]", thumbPath, initialQuality)
+				cmdVips := exec.Command("vips", "copy", tempFramePath, outputParams)
 
+				if errVips := cmdVips.Run(); errVips != nil {
+					os.Rename(tempFramePath, thumbPath)
+				} else {
+					os.Remove(tempFramePath)
+				}
+			} else {
+				thumbPath, err = optimizeImage(tempFramePath, thumbDir, baseName)
+				if err != nil {
+					slog.Error("Falha na otimização da thumbnail do vídeo", "file_id", file.ID, "error", err)
+					thumbPath = ""
+				}
+				os.Remove(tempFramePath)
+			}
+		}
+	}
 
-func processVideoPreview(client *gorm.DB, file *db.UploadedFile) error {
-    baseName := strings.TrimSuffix(filepath.Base(file.SavedPath), filepath.Ext(file.SavedPath))
+	gifPath, err := optimizeGif(file.SavedPath, gifDir, baseName)
+	if err != nil {
+		slog.Error("GIF generation and optimization failed", "file_id", file.ID, "error", err)
+		gifPath = ""
+	}
 
-    thumbDir := filepath.Join(config.ThumbDir, "t")
-    gifDir := filepath.Join(config.ThumbDir, "p")
+	webpPath, err := optimizeWebp(file.SavedPath, webpDir, baseName)
+	if err != nil {
+		slog.Error("WebP generation and optimization failed", "file_id", file.ID, "error", err)
+		webpPath = ""
+	}
 
-    if err := os.MkdirAll(thumbDir, 0755); err != nil {
-        client.Model(file).Updates(map[string]interface{}{
-            "preview_status": "error",
-            "preview_error":  fmt.Sprintf("mkdir thumb dir failed: %v", err),
-        })
-        return err
-    }
-    if err := os.MkdirAll(gifDir, 0755); err != nil {
-        client.Model(file).Updates(map[string]interface{}{
-            "preview_status": "error",
-            "preview_error":  fmt.Sprintf("mkdir gif dir failed: %v", err),
-        })
-        return err
-    }
+	fields := &db.PreviewFields{
+		ThumbnailPath: thumbPath,
+		GifPath:       gifPath,
+		WebpPath:      webpPath,
+	}
 
-    thumbPath := filepath.Join(thumbDir, baseName+".jpg")
-    gifPath := filepath.Join(gifDir, baseName+".gif")
+	return db.UpdateFilePreview(ctx, client, file.ID, "done", "", fields)
+}
 
-    cmdThumb := exec.Command("ffmpeg", "-i", file.SavedPath, "-ss", "00:00:05",
-        "-vf", "scale=200:200:force_original_aspect_ratio=decrease", "-vframes", "1", thumbPath)
-    if out, err := cmdThumb.CombinedOutput(); err != nil {
-        cmdThumb = exec.Command("ffmpeg", "-i", file.SavedPath, "-ss", "00:00:01",
-            "-vf", "scale=200:200:force_original_aspect_ratio=decrease", "-vframes", "1", thumbPath)
-        if _, err2 := cmdThumb.CombinedOutput(); err2 != nil {
-            log.Printf("Thumbnail generation failed: %v, output: %s", err, out)
-            thumbPath = ""
-        }
-    }
+func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
+	tracker := newTracker()
+	defer tracker.Cleanup()
 
-    cmdGif := exec.Command("ffmpeg", "-i", file.SavedPath, "-vf", "fps=10,scale=320:-1", "-t", "3", gifPath)
-    if _, err := cmdGif.CombinedOutput(); err != nil {
-        os.Remove(gifPath)
-        gifPath = ""
-        log.Printf("GIF generation failed for %s: %v", file.ID, err)
-    }
+	finalWebpPath := filepath.Join(webpDir, baseName+".webp")
 
-    webpPath := filepath.Join(filepath.Join(config.ThumbDir, "w"), baseName+".webp")
-    if err := os.MkdirAll(filepath.Dir(webpPath), 0755); err == nil {
-        cmdWebp := exec.Command("ffmpeg", "-y", "-i", file.SavedPath,
-            "-vf", "fps=10,scale=320:-2:flags=lanczos",
-            "-c:v", "libwebp",
-            "-q:v", "60",
-            //"-t", "2",
-            "-loop", "0",
-            "-preset", "picture",
-            webpPath)
+	localMaxBytes := maxSizeBytes
+	localMinBytes := minSizeBytes
 
-        if out, err := cmdWebp.CombinedOutput(); err != nil {
-        	log.Printf("WebP generation failed for %s: %v | Output: %s", file.ID, err, string(out))
-            os.Remove(webpPath)
-            webpPath = ""
-            log.Printf("WebP generation failed for %s: %v", file.ID, err)
-        }
-    }
+	origFileInfo, err := os.Stat(sourcePath)
+	if err == nil {
+		origSize := origFileInfo.Size()
+		if origSize < localMaxBytes {
+			localMaxBytes = origSize
+		}
+		if localMinBytes >= localMaxBytes {
+			localMinBytes = localMaxBytes / 2
+		}
+	}
 
-    updates := map[string]interface{}{
-        "preview_status":   "done",
-        "thumbnail_path":   thumbPath,
-        "preview_gif_path": gifPath,
-    }
-    if thumbPath == "" {
-        updates["thumbnail_path"] = nil
-    }
-    if gifPath == "" {
-        updates["preview_gif_path"] = nil
-    }
-    client.Model(file).Updates(updates)
-    return nil
+	var bestFallbackPath string
+	var bestFallbackSize int64
+
+	scale := 1.0
+	minScale := 0.2
+
+	initQuality := 80
+	minQ := 10
+
+	for scale >= minScale {
+		maxPath, maxSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, initQuality)
+		if err != nil {
+			return "", err
+		}
+		tracker.Track(maxPath)
+
+		// ATENÇÃO: Substitua todos os 'maxSizeBytes' e 'minSizeBytes' deste loop por 'localMaxBytes' e 'localMinBytes'
+		if scale == 1.0 && maxSize < localMinBytes {
+			tracker.Untrack(maxPath)
+			return renameToFinal(maxPath, finalWebpPath)
+		}
+
+		if maxSize >= localMinBytes && maxSize <= localMaxBytes {
+			tracker.Untrack(maxPath)
+			return renameToFinal(maxPath, finalWebpPath)
+		}
+
+		if maxSize < localMinBytes {
+			if bestFallbackPath != "" {
+				tracker.Untrack(bestFallbackPath)
+				return renameToFinal(bestFallbackPath, finalWebpPath)
+			}
+			tracker.Untrack(maxPath)
+			return renameToFinal(maxPath, finalWebpPath)
+		}
+
+		minPath, minSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, minQ)
+		if err != nil {
+			return "", err
+		}
+		tracker.Track(minPath)
+
+		if minSize > localMaxBytes {
+			os.Remove(maxPath)
+			tracker.Untrack(maxPath)
+			os.Remove(minPath)
+			tracker.Untrack(minPath)
+			scale *= dimReduceFactor
+			continue
+		}
+
+		if minSize >= localMinBytes && minSize <= localMaxBytes {
+			tracker.Untrack(minPath)
+			return renameToFinal(minPath, finalWebpPath)
+		}
+
+		os.Remove(minPath)
+		tracker.Untrack(minPath)
+
+		low := minQ
+		high := initQuality - 1
+
+		for low <= high {
+			midQuality := (low + high) / 2
+			midPath, midSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, midQuality)
+			if err != nil {
+				break
+			}
+			tracker.Track(midPath)
+
+			if midSize >= localMinBytes && midSize <= localMaxBytes {
+				tracker.Untrack(midPath)
+				return renameToFinal(midPath, finalWebpPath)
+			}
+
+			if midSize < localMinBytes {
+				if midSize > bestFallbackSize {
+					if bestFallbackPath != "" {
+						os.Remove(bestFallbackPath)
+						tracker.Untrack(bestFallbackPath)
+					}
+					bestFallbackPath = midPath
+					bestFallbackSize = midSize
+				} else {
+					os.Remove(midPath)
+					tracker.Untrack(midPath)
+				}
+				low = midQuality + 1
+			} else {
+				os.Remove(midPath)
+				tracker.Untrack(midPath)
+				high = midQuality - 1
+			}
+		}
+
+		if bestFallbackPath != "" {
+			tracker.Untrack(bestFallbackPath)
+			return renameToFinal(bestFallbackPath, finalWebpPath)
+		}
+
+		os.Remove(maxPath)
+		tracker.Untrack(maxPath)
+		scale *= dimReduceFactor
+	}
+
+	return "", fmt.Errorf("unable to bring video webp preview under size limit with given constraints")
+}
+
+func runFFmpegWebp(sourcePath, webpDir, baseName string, scale float64, quality int) (string, int64, error) {
+	tempPath := filepath.Join(webpDir, fmt.Sprintf("%s_q%d_s%d.webp", baseName, quality, int(scale*100)))
+	scaleExpr := fmt.Sprintf("trunc(iw*%f/2)*2", scale)
+
+	cmd := exec.Command("ffmpeg", "-y",
+		"-t", "3",
+		"-i", sourcePath,
+		"-vf", fmt.Sprintf("fps=10,scale=%s:-2:flags=lanczos", scaleExpr),
+		"-c:v", "libwebp",
+		"-compression_level", "5",
+		"-q:v", fmt.Sprintf("%d", quality),
+		"-loop", "0",
+		tempPath)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", 0, fmt.Errorf("ffmpeg webp failed: %v, output: %s", err, string(out))
+	}
+
+	fi, err := os.Stat(tempPath)
+	if err != nil {
+		return "", 0, err
+	}
+
+	return tempPath, fi.Size(), nil
+}
+
+func optimizeGif(sourcePath, gifDir, baseName string) (string, error) {
+	tracker := newTracker()
+	defer tracker.Cleanup()
+
+	finalGifPath := filepath.Join(gifDir, baseName+".gif")
+
+	localMaxBytes := maxSizeBytes
+	localMinBytes := minSizeBytes
+
+	origFileInfo, err := os.Stat(sourcePath)
+	if err == nil {
+		origSize := origFileInfo.Size()
+		if origSize < localMaxBytes {
+			localMaxBytes = origSize
+		}
+		if localMinBytes >= localMaxBytes {
+			localMinBytes = localMaxBytes / 2
+		}
+	}
+
+	var bestFallbackPath string
+	var bestFallbackSize int64
+
+	scale := 1.0
+	minScale := 0.2
+
+	initFps := 12
+	minFps := 4
+
+	for scale >= minScale {
+		maxPath, maxSize, err := runFFmpegGif(sourcePath, gifDir, baseName, scale, initFps)
+		if err != nil {
+			return "", err
+		}
+		tracker.Track(maxPath)
+
+		if scale == 1.0 && maxSize < localMinBytes {
+			tracker.Untrack(maxPath)
+			return renameToFinal(maxPath, finalGifPath)
+		}
+
+		if maxSize >= localMinBytes && maxSize <= localMaxBytes {
+			tracker.Untrack(maxPath)
+			return renameToFinal(maxPath, finalGifPath)
+		}
+
+		if maxSize < localMinBytes {
+			if bestFallbackPath != "" {
+				tracker.Untrack(bestFallbackPath)
+				return renameToFinal(bestFallbackPath, finalGifPath)
+			}
+			tracker.Untrack(maxPath)
+			return renameToFinal(maxPath, finalGifPath)
+		}
+
+		minPath, minSize, err := runFFmpegGif(sourcePath, gifDir, baseName, scale, minFps)
+		if err != nil {
+			return "", err
+		}
+		tracker.Track(minPath)
+
+		if minSize > localMaxBytes {
+			os.Remove(maxPath)
+			tracker.Untrack(maxPath)
+			os.Remove(minPath)
+			tracker.Untrack(minPath)
+			scale *= dimReduceFactor
+			continue
+		}
+
+		if minSize >= localMinBytes && minSize <= localMaxBytes {
+			tracker.Untrack(minPath)
+			return renameToFinal(minPath, finalGifPath)
+		}
+
+		os.Remove(minPath)
+		tracker.Untrack(minPath)
+
+		low := minFps
+		high := initFps - 1
+
+		for low <= high {
+			midFps := (low + high) / 2
+			midPath, midSize, err := runFFmpegGif(sourcePath, gifDir, baseName, scale, midFps)
+			if err != nil {
+				break
+			}
+			tracker.Track(midPath)
+
+			if midSize >= localMinBytes && midSize <= localMaxBytes {
+				tracker.Untrack(midPath)
+				return renameToFinal(midPath, finalGifPath)
+			}
+
+			if midSize < localMinBytes {
+				if midSize > bestFallbackSize {
+					if bestFallbackPath != "" {
+						os.Remove(bestFallbackPath)
+						tracker.Untrack(bestFallbackPath)
+					}
+					bestFallbackPath = midPath
+					bestFallbackSize = midSize
+				} else {
+					os.Remove(midPath)
+					tracker.Untrack(midPath)
+				}
+				low = midFps + 1
+			} else {
+				os.Remove(midPath)
+				tracker.Untrack(midPath)
+				high = midFps - 1
+			}
+		}
+
+		if bestFallbackPath != "" {
+			tracker.Untrack(bestFallbackPath)
+			return renameToFinal(bestFallbackPath, finalGifPath)
+		}
+
+		os.Remove(maxPath)
+		tracker.Untrack(maxPath)
+		scale *= dimReduceFactor
+	}
+
+	return "", fmt.Errorf("unable to bring video gif preview under %vMB with given constraints", targetSizeMB)
+}
+
+func runFFmpegGif(sourcePath, gifDir, baseName string, scale float64, fps int) (string, int64, error) {
+	tempPath := filepath.Join(gifDir, fmt.Sprintf("%s_fps%d_s%d.gif", baseName, fps, int(scale*100)))
+	scaleExpr := fmt.Sprintf("trunc(iw*%f/2)*2", scale)
+
+	cmd := exec.Command("ffmpeg", "-y",
+		"-t", "3",
+		"-i", sourcePath,
+		"-vf", fmt.Sprintf("fps=%d,scale=%s:-2:flags=lanczos", fps, scaleExpr),
+		tempPath)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", 0, fmt.Errorf("ffmpeg gif failed: %v, output: %s", err, string(out))
+	}
+
+	fi, err := os.Stat(tempPath)
+	if err != nil {
+		return "", 0, err
+	}
+
+	return tempPath, fi.Size(), nil
 }

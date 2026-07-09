@@ -1,20 +1,24 @@
+// Package utils
 package utils
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
-	"log"
 
-	"gorm.io/gorm"
+	"github.com/Marlliton/slogpretty"
+	"github.com/uptrace/bun"
+
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
 )
@@ -52,8 +56,8 @@ func SanitizeSubfolderName(name string) (string, error) {
 	return cleaned, nil
 }
 
-func ParseTimeRange(from, to string, days int) (map[string]interface{}, error) {
-	filters := make(map[string]interface{})
+func ParseTimeRange(from, to string, days int) (map[string]any, error) {
+	filters := make(map[string]any)
 	if days > 0 {
 		filters["uploaded_at >= ?"] = time.Now().AddDate(0, 0, -days)
 	} else {
@@ -75,11 +79,16 @@ func ParseTimeRange(from, to string, days int) (map[string]interface{}, error) {
 	return filters, nil
 }
 
-func ExecuteFileDeletion(client *gorm.DB, file *db.UploadedFile) error {
-	return client.Transaction(func(tx *gorm.DB) error {
+func ExecuteFileDeletion(ctx context.Context, client *bun.DB, file *db.UploadedFile) error {
+	return client.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
 		srcPath := file.SavedPath
-		var count int64
-		if err := tx.Model(&db.UploadedFile{}).Where("saved_path = ? AND id != ?", srcPath, file.ID).Count(&count).Error; err != nil {
+
+		removeIfExists(file.ThumbnailPath)
+		removeIfExists(file.PreviewGifPath)
+		removeIfExists(file.PreveiwWebpPath)
+
+		count, err := db.CountOtherFilesSharingPath(ctx, tx, srcPath, file.ID)
+		if err != nil {
 			return err
 		}
 
@@ -92,35 +101,21 @@ func ExecuteFileDeletion(client *gorm.DB, file *db.UploadedFile) error {
 					return err
 				}
 			} else {
-				if err := os.Remove(srcPath); err != nil {
-					return err
-				}
+				_ = os.Remove(srcPath)
 			}
 		}
 
-		log := db.DeletedFileLog{
-			OriginalID: file.ID,
-			Filename:   file.Filename,
-			FileSize:   file.FileSize,
-			FileHash:   file.FileHash,
-			UploadedAt: file.UploadedAt,
-			PurgeAt:    time.Now().Add(1 * time.Hour),
-			TrashPath:  trashPath,
-			MetaJSON:   fmt.Sprintf(`{"ip_address":"%s","country":"%s"}`, file.IPAddress, file.Country),
-		}
-		if err := tx.Create(&log).Error; err != nil {
+		if err := db.InsertDeletedFileLog(ctx, tx, file, trashPath); err != nil {
 			return err
 		}
-		if err := tx.Delete(file).Error; err != nil {
-			return err
-		}
-		return nil
+
+		return db.DeleteUploadedFileByID(ctx, tx, file.ID)
 	})
 }
 
-func PurgeTrashOnStartup(client *gorm.DB) error {
-	var logs []db.DeletedFileLog
-	if err := client.Where("purge_at <= ? AND processed = ?", time.Now(), false).Find(&logs).Error; err != nil {
+func PurgeTrashOnStartup(ctx context.Context, client *bun.DB) error {
+	logs, err := db.GetUnprocessedExpiredLogs(ctx, client, time.Now())
+	if err != nil {
 		return err
 	}
 
@@ -131,44 +126,48 @@ func PurgeTrashOnStartup(client *gorm.DB) error {
 			}
 		}
 
-		if err := client.Model(&logItem).Update("processed", true).Error; err != nil {
+		if err := db.MarkDeletedLogAsProcessed(ctx, client, logItem.ID); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func StartBackgroundTasks(client *gorm.DB) {
-	startPreviewWorkers(client, 3)
+func StartBackgroundTasks(ctx context.Context, client *bun.DB) {
+	startPreviewWorkers(ctx, client, 3)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				runPurge(client)
+				runPurge(ctx, client)
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
-	log.Println("Background tasks started (TTL and trash purger)")
+	slog.Info("Background tasks started (TTL and trash purger)")
 }
 
-func runPurge(client *gorm.DB) {
-	var expired []db.UploadedFile
+func runPurge(ctx context.Context, client *bun.DB) {
 	now := time.Now()
-	if err := client.Where("expires_at IS NOT NULL AND expires_at <= ?", now).Find(&expired).Error; err != nil {
-		log.Printf("Error finding expired files: %v", err)
+
+	expired, err := db.GetExpiredUploadedFiles(ctx, client, now)
+	if err != nil {
+		slog.Error("Error finding expired files", "error", err)
 		return
 	}
+
 	for _, f := range expired {
-		if err := ExecuteFileDeletion(client, &f); err != nil {
-			log.Printf("Error deleting expired file %s: %v", f.ID, err)
+		if err := ExecuteFileDeletion(ctx, client, &f); err != nil {
+			slog.Error("Error deleting expired file", "file_id", f.ID, "error", err)
 		}
 	}
 
-	var pendingLogs []db.DeletedFileLog
-	if err := client.Where("purge_at <= ? AND processed = ?", now, false).Find(&pendingLogs).Error; err != nil {
-		log.Printf("Error finding purgable logs: %v", err)
+	pendingLogs, err := db.GetUnprocessedExpiredLogs(ctx, client, now)
+	if err != nil {
+		slog.Error("Error finding purgable logs", "error", err)
 		return
 	}
 
@@ -176,37 +175,84 @@ func runPurge(client *gorm.DB) {
 		if entry.TrashPath != "" {
 			if _, err := os.Stat(entry.TrashPath); err == nil {
 				if err := os.Remove(entry.TrashPath); err != nil {
-					log.Printf("Error removing trash file %s: %v", entry.TrashPath, err)
+					slog.Error("Error removing trash file", "trash_path", entry.TrashPath, "error", err)
 				}
 			}
 		}
 
-		if err := client.Model(&entry).Update("processed", true).Error; err != nil {
-			log.Printf("Error updating log status for ID %d: %v", entry.ID, err)
+		if err := db.MarkDeletedLogAsProcessed(ctx, client, entry.ID); err != nil {
+			slog.Error("Error updating log status", "log_id", entry.ID, "error", err)
 		}
 	}
 }
 
-func startPreviewWorkers(client *gorm.DB, numWorkers int) {
-    for i := 0; i < numWorkers; i++ {
-        go func() {
-            for job := range PreviewQueue {
-                jobWg.Add(1)
-                func(j PreviewJob) {
-                    defer jobWg.Done()
-                    log.Printf("Processing preview job for file %s (attempt %d)", j.FileID, j.RetryCount)
-                    err := ProcessPreviewJob(client, j)
-                    if err != nil {
-                        if j.RetryCount < 3 {
-                            j.RetryCount++
-                            time.Sleep(time.Duration(j.RetryCount*10) * time.Second)
-                            PreviewQueue <- j
-                        } else {
-                            log.Printf("Preview job failed permanently for file %s: %v", j.FileID, err)
-                        }
-                    }
-                }(job)
-            }
-        }()
-    }
+func startPreviewWorkers(ctx context.Context, client *bun.DB, numWorkers int) {
+	for i := 0; i < numWorkers; i++ {
+		go func(workerID int) {
+			logger := WithWorker(workerID)
+			for job := range PreviewQueue {
+				jobWg.Add(1)
+				func(j PreviewJob) {
+					defer jobWg.Done()
+					logger.Info("processing preview job", "file_id", j.FileID, "attempt", j.RetryCount)
+
+					jobCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+					defer cancel()
+
+					err := ProcessPreviewJob(jobCtx, client, j)
+					if err != nil {
+						if j.RetryCount < 3 {
+							j.RetryCount++
+							time.Sleep(time.Duration(j.RetryCount*10) * time.Second)
+							select {
+							case PreviewQueue <- j:
+								logger.Info("re-enqueued job", "file_id", j.FileID, "attempt", j.RetryCount)
+							default:
+								logger.Warn("queue full, dropping retry", "file_id", j.FileID)
+							}
+						} else {
+							logger.Error("preview job failed permanently", "file_id", j.FileID, "error", err)
+						}
+					}
+				}(job)
+			}
+		}(i)
+	}
+}
+
+func InitLogger(environment string) {
+	var level slog.Level
+
+	switch environment {
+	case "debug":
+		level = slog.LevelDebug
+	default:
+		level = slog.LevelInfo
+	}
+
+	if environment == "production" {
+		handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+		slog.SetDefault(slog.New(handler))
+		return
+	}
+
+	handler := slogpretty.New(os.Stdout, &slogpretty.Options{
+		Level:     level,
+		AddSource: true, // Show file location
+		Colorful:  true, // Enable colors. Default is true
+		// Multiline:  true,                        // Pretty print for complex data
+		TimeFormat: slogpretty.DefaultTimeFormat, // Custom format (e.g., time.Kitchen)
+	})
+
+	slog.SetDefault(slog.New(handler))
+}
+
+func WithWorker(id int) *slog.Logger {
+	return slog.Default().With(slog.Int("worker", id))
+}
+
+func removeIfExists(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+	}
 }
