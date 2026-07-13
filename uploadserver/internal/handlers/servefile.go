@@ -79,7 +79,7 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 			if !r.URL.Query().Has("b") {
 				var targetHost string
 				if strings.Contains(r.Host, "localhost") {
-					targetHost = strings.Replace(r.Host, "i.localhost", "upload.localhost", 1)
+					targetHost = strings.Replace(r.Host, "ip.localhost", "upload.localhost", 1)
 				} else {
 					targetHost = strings.Replace(r.Host, config.Proxy+".", config.Cdn+".", 1)
 				}
