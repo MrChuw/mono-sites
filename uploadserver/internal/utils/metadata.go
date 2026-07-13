@@ -23,7 +23,20 @@ func StripAllMetadata(path string, fileType string) error {
 		return fallbackReprocess(path, fileType)
 	}
 
-	fileInfos[0].Fields = make(map[string]any)
+	keepTags := map[string]bool{
+		"Orientation": true,
+		"ColorSpace":  true,
+	}
+
+	cleanFields := make(map[string]any)
+	for tag, value := range fileInfos[0].Fields {
+		if keepTags[tag] {
+			cleanFields[tag] = value
+		}
+	}
+
+	fileInfos[0].Fields = cleanFields
+
 	ExifDaemon.WriteMetadata(fileInfos)
 
 	if fileInfos[0].Err != nil {
@@ -45,7 +58,7 @@ func fallbackReprocess(path string, fileType string) error {
 		ext := filepath.Ext(path)
 		tmpPath := path + ".tmp" + ext
 
-		cmd := exec.Command("vips", "copy", path, tmpPath+"[strip=true]")
+		cmd := exec.Command("vips", "copy", path, tmpPath+"[strip=true,autorot=true]")
 		if err := cmd.Run(); err != nil {
 			os.Remove(tmpPath)
 			return fmt.Errorf("vips fallback: %w", err)
@@ -63,6 +76,7 @@ func fallbackReprocess(path string, fileType string) error {
 			"-i", path,
 			"-map", "0",
 			"-map_metadata", "-1",
+			"-map_metadata:s:v", "0",
 			"-map_chapters", "-1",
 			"-c", "copy",
 		}

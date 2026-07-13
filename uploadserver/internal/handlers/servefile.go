@@ -63,6 +63,16 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 			return
 		}
 
+		etag := fmt.Sprintf(`"%d-%d"`, info.ModTime().Unix(), info.Size())
+
+		if strings.Contains(r.URL.Path, "/preview/") {
+			w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
+			w.Header().Set("Vary", "Origin")
+		} else {
+			w.Header().Set("Cache-Control", "public, max-age=60, must-revalidate")
+		}
+		w.Header().Set("ETag", etag)
+
 		hostType := r.Header.Get("X-Host-Type")
 
 		if hostType == "no-cache" {
@@ -79,16 +89,6 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 				return
 			}
 		}
-
-		etag := fmt.Sprintf(`"%d-%d"`, info.ModTime().Unix(), info.Size())
-
-		if strings.Contains(r.URL.Path, "/preview/") {
-			w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
-			w.Header().Set("Vary", "Origin")
-		} else {
-			w.Header().Set("Cache-Control", "public, max-age=300, immutable")
-		}
-		w.Header().Set("ETag", etag)
 
 		mime := mime.TypeByExtension(strings.ToLower(filepath.Ext(fullPath)))
 
