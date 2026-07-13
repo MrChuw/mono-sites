@@ -14,6 +14,14 @@ import (
 var ExifDaemon *exiftool.Exiftool
 
 func StripAllMetadata(path string, fileType string) error {
+	lowerPath := strings.ToLower(path)
+
+	if strings.HasSuffix(lowerPath, ".heic") || strings.HasSuffix(lowerPath, ".heif") {
+		if err := stripHeicMotionPhoto(path); err != nil {
+			slog.Warn("Failed to clean embedded video, proceeding anyway", "error", err)
+		}
+	}
+
 	if strings.HasPrefix(fileType, "video/") || strings.HasPrefix(fileType, "audio/") {
 		return fallbackReprocess(path, fileType)
 	}
@@ -24,8 +32,11 @@ func StripAllMetadata(path string, fileType string) error {
 	}
 
 	keepTags := map[string]bool{
-		"Orientation": true,
-		"ColorSpace":  true,
+		"Orientation":                        true,
+		"ColorSpace":                         true,
+		"MotionPhoto":                        true,
+		"MotionPhotoVersion":                 true,
+		"MotionPhotoPresentationTimestampUs": true,
 	}
 
 	cleanFields := make(map[string]any)
@@ -36,7 +47,6 @@ func StripAllMetadata(path string, fileType string) error {
 	}
 
 	fileInfos[0].Fields = cleanFields
-
 	ExifDaemon.WriteMetadata(fileInfos)
 
 	if fileInfos[0].Err != nil {
@@ -95,5 +105,58 @@ func fallbackReprocess(path string, fileType string) error {
 		return nil
 	}
 
+	return nil
+}
+
+func stripHeicMotionPhoto(path string) error {
+	cmd := exec.Command("exiftool", "-b", "-MotionPhotoVideo", path)
+	videoBytes, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to extract embedded video bytes: %w", err)
+	}
+
+	if len(videoBytes) == 0 {
+		return nil
+	}
+
+	tmpDir := filepath.Dir(path)
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	tmpVideo := filepath.Join(tmpDir, base+".motion.mp4")
+
+	if err := os.WriteFile(tmpVideo, videoBytes, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary video payload: %w", err)
+	}
+	defer os.Remove(tmpVideo)
+
+	videoInfos := ExifDaemon.ExtractMetadata(tmpVideo)
+	if len(videoInfos) > 0 && videoInfos[0].Err == nil {
+		keepVideoTags := map[string]bool{
+			"Orientation": true,
+			"ColorSpace":  true,
+		}
+
+		cleanVideoFields := make(map[string]any)
+		for tag := range videoInfos[0].Fields {
+			if keepVideoTags[tag] {
+				cleanVideoFields[tag] = videoInfos[0].Fields[tag]
+			} else {
+				cleanVideoFields[tag] = nil
+			}
+		}
+
+		videoInfos[0].Fields = cleanVideoFields
+		ExifDaemon.WriteMetadata(videoInfos)
+
+		if videoInfos[0].Err != nil {
+			return fmt.Errorf("failed to strip unwanted video tags via daemon: %w", videoInfos[0].Err)
+		}
+	}
+
+	insertCmd := exec.Command("exiftool", "-overwrite_original", fmt.Sprintf("-MotionPhotoVideo<=%s", tmpVideo), path)
+	if out, err := insertCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to re-inject sanitized video stream into container: %w, output: %s", err, out)
+	}
+
+	slog.Info("Embedded video (Motion Photo) successfully sanitized", "path", path)
 	return nil
 }

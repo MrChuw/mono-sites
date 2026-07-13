@@ -86,6 +86,10 @@ func ProcessPreviewJob(ctx context.Context, client *bun.DB, job PreviewJob) erro
 			mimeType = "image/jxl"
 		case ".avif":
 			mimeType = "image/avif"
+		case ".heic":
+			mimeType = "image/heic"
+		case ".heif":
+			mimeType = "image/heif"
 		}
 	}
 
@@ -107,7 +111,34 @@ func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 		return err
 	}
 
-	fileInfo, err := os.Stat(file.SavedPath)
+	lowerPath := strings.ToLower(file.SavedPath)
+	isHeic := strings.HasSuffix(lowerPath, ".heic") || strings.HasSuffix(lowerPath, ".heif")
+
+	sourcePath := file.SavedPath
+	var tmpJpgPath string
+
+	if isHeic {
+		slog.Info("HEIC/HEIF container detected, extraction step initiated", "file_id", file.ID)
+		tmpJpgPath = filepath.Join(thumbDir, "tmp_src_"+baseName+".jpg")
+
+		cmdExtract := exec.Command("exiftool", "-b", "-PreviewImage", file.SavedPath)
+		if out, err := cmdExtract.Output(); err == nil && len(out) > 0 {
+			_ = os.WriteFile(tmpJpgPath, out, 0644)
+		} else {
+			slog.Debug("No embedded preview found via metadata, falling back to ffmpeg translation", "file_id", file.ID)
+			cmdFfmpeg := exec.Command("ffmpeg", "-y", "-i", file.SavedPath, "-frames:v", "1", "-f", "image2", tmpJpgPath)
+			if err := cmdFfmpeg.Run(); err != nil {
+				errMsg := fmt.Sprintf("failed to decode HEIC via ffmpeg: %v", err)
+				_ = db.UpdateFilePreview(ctx, client, file.ID, "error", errMsg, nil)
+				return err
+			}
+		}
+
+		sourcePath = tmpJpgPath
+		defer os.Remove(tmpJpgPath)
+	}
+
+	fileInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		errMsg := fmt.Sprintf("failed to stat original file: %v", err)
 		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", errMsg, nil)
@@ -122,7 +153,7 @@ func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 		finalThumbPath = filepath.Join(thumbDir, baseName+".jpg")
 		os.Remove(finalThumbPath)
 		outputParams := fmt.Sprintf("%s[Q=%d,optimize_coding=true]", finalThumbPath, initialQuality)
-		cmd := exec.Command("vips", "copy", file.SavedPath, outputParams)
+		cmd := exec.Command("vips", "copy", sourcePath, outputParams)
 
 		if out, err := cmd.CombinedOutput(); err != nil {
 			errMsg := fmt.Sprintf("failed to generate preview for small file: %v, output: %s", err, string(out))
@@ -132,7 +163,7 @@ func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 	} else {
 		slog.Debug("Original image exceeds target size, initializing optimizer", "file_id", file.ID)
 
-		finalThumbPath, err = optimizeImage(file.SavedPath, thumbDir, baseName)
+		finalThumbPath, err = optimizeImage(sourcePath, thumbDir, baseName)
 		if err != nil {
 			_ = db.UpdateFilePreview(ctx, client, file.ID, "error", err.Error(), nil)
 			return err
@@ -320,7 +351,7 @@ func processVideoPreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 	if out, err := cmdThumb.CombinedOutput(); err != nil {
 		cmdThumb = exec.Command("ffmpeg", "-y", "-ss", "00:00:01", "-i", file.SavedPath, "-q:v", "2", "-vframes", "1", tempFramePath)
 		if _, err2 := cmdThumb.CombinedOutput(); err2 != nil {
-			slog.Error("Falha ao extrair frame temporário", "error", err, "output", string(out))
+			slog.Error("Failed to extract temporary frame", "error", err, "output", string(out))
 			tempFramePath = ""
 		}
 	}
@@ -344,7 +375,7 @@ func processVideoPreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 			} else {
 				thumbPath, err = optimizeImage(tempFramePath, thumbDir, baseName)
 				if err != nil {
-					slog.Error("Falha na otimização da thumbnail do vídeo", "file_id", file.ID, "error", err)
+					slog.Error("Failed to optimize video thumbnail", "file_id", file.ID, "error", err)
 					thumbPath = ""
 				}
 				os.Remove(tempFramePath)
@@ -409,7 +440,6 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 		}
 		tracker.Track(maxPath)
 
-		// ATENÇÃO: Substitua todos os 'maxSizeBytes' e 'minSizeBytes' deste loop por 'localMaxBytes' e 'localMinBytes'
 		if scale == 1.0 && maxSize < localMinBytes {
 			tracker.Untrack(maxPath)
 			return renameToFinal(maxPath, finalWebpPath)
