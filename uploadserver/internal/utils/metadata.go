@@ -65,15 +65,28 @@ func fallbackReprocess(path string, fileType string) error {
 	}
 
 	if strings.HasPrefix(fileType, "image/") {
-		ext := filepath.Ext(path)
+		ext := strings.ToLower(filepath.Ext(path))
 		tmpPath := path + ".tmp" + ext
 
-		cmd := exec.Command("vips", "copy", path, tmpPath+"[strip=true,autorot=true]")
-		if err := cmd.Run(); err != nil {
-			os.Remove(tmpPath)
-			return fmt.Errorf("vips fallback: %w", err)
+		inputPath := path
+		if ext == ".jpg" || ext == ".jpeg" || ext == ".tif" || ext == ".tiff" || ext == ".heic" {
+			inputPath = path + "[autorot=true]"
 		}
-		return os.Rename(tmpPath, path)
+
+		outputPath := tmpPath + "[strip=true]"
+
+		cmd := exec.Command("vips", "copy", inputPath, outputPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("vips fallback: %w, output: %s", err, string(out))
+		}
+
+		if err := os.Rename(tmpPath, path); err != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("rename failed: %w", err)
+		}
+
+		return nil
 	}
 
 	if strings.HasPrefix(fileType, "video/") || strings.HasPrefix(fileType, "audio/") {
