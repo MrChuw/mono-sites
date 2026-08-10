@@ -29,8 +29,8 @@
             "health": "/"
         },
         "https://rm.lilb.dev/api/v2/recent-messages": {
-            "maintainer": "https://github.com/zneix",
-            "path": "zneix",
+            "maintainer": "https://www.twitch.tv/lilb_lxryer",
+            "path": "lilb",
             "health": "/"
         }
     },
