@@ -8,5 +8,5 @@ services:
         ports:
             - "8000:8000"
         volumes:
-            - ./config.json:/app/config.json:ro
+            - ./config.json:/config.json:ro
         restart: unless-stopped
