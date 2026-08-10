@@ -31,6 +31,10 @@
             "maintainer": "https://www.twitch.tv/lilb_lxryer",
             "path": "lilb",
             "health": "/"
+        },
+        "https://recentmessages.ivr.fi/api/v2/recent-messages": {
+            "maintainer": "https://www.twitch.tv/leppunen",
+            "path": "leppunen"
         }
     },
     "link_resolverInstances": {
