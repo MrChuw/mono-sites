@@ -88,7 +88,7 @@ type Config struct {
 func NewConfig() *Config {
 	return &Config{
 		InstanceConfig: InstanceConfig{
-			UserAgent:         "chatterino-proxy/1.0",
+			UserAgent:         "chatterino-proxy/1.0.1",
 			HeartbeatInterval: 30,
 			Timeout:           30.0,
 			HealthTimeout:     5.0,

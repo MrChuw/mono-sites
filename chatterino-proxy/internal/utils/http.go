@@ -44,7 +44,7 @@ func StartHeartbeat(ctx context.Context, cfg *config.Config, healthClient *http.
 					defer wg.Done()
 					checkURL := upstream.GetCheckURL()
 
-					req, err := http.NewRequestWithContext(ctx, http.MethodHead, checkURL, nil)
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
 					if err != nil {
 						upstream.SetHealthAndLatency(false, 0)
 						return
