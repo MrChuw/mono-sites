@@ -1,0 +1,43 @@
+{
+    "instance": {
+        "maintainer": "MrChuw",
+        "message": "Contact me for updates!",
+        "url": "chatproxy.mrchuw.com.br",
+        "userAgent": "chatterino-proxy/1.0",
+        "heartbeatInterval": 30,
+        "timeout": 30.0,
+        "healthTimeout": 5.0,
+        "race": true,
+        "description": ""
+    },
+    "rmInstances": {
+        "race": true,
+        "https://logs.zonian.dev/rm": {
+            "maintainer": "https://github.com/ZonianMidian",
+            "path": "zonian",
+            "health": "/health",
+            "description": ""
+        },
+        "https://recent-messages.robotty.de/api/v2/recent-messages": {
+            "maintainer": "https://github.com/randers00",
+            "path": "rm",
+            "health": "/"
+        },
+        "https://recent-messages.zneix.eu/api/v2/recent-messages": {
+            "maintainer": "https://github.com/zneix",
+            "path": "zneix",
+            "health": "/"
+        }
+    },
+    "link_resolverInstances": {
+        "race": true,
+        "https://braize.pajlada.com/chatterino/link_resolver": {
+            "maintainer": "https://github.com/pajlada",
+            "path": "pajlada"
+        },
+        "https://capi.mrchuw.com.br/link_resolver": {
+            "maintainer": "https://github.com/mrchuw",
+            "path": "mrchuw"
+        }
+    }
+}

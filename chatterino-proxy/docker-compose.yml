@@ -1,0 +1,11 @@
+services:
+    chatterino-proxy:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        container_name: chatterino-proxy
+        ports:
+            - "8000:8000"
+        volumes:
+            - ./config.json:/app/config.json:ro
+        restart: unless-stopped
