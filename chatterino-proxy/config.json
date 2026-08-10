@@ -27,6 +27,11 @@
             "maintainer": "https://github.com/zneix",
             "path": "zneix",
             "health": "/"
+        },
+        "https://rm.lilb.dev/api/v2/recent-messages": {
+            "maintainer": "https://github.com/zneix",
+            "path": "zneix",
+            "health": "/"
         }
     },
     "link_resolverInstances": {
