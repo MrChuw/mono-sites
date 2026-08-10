@@ -3,6 +3,7 @@ services:
         build:
             context: .
             dockerfile: Dockerfile
+        image: ghcr.io/mrchuw/chatterino-proxy:latest
         container_name: chatterino-proxy
         ports:
             - "8000:8000"

@@ -38,11 +38,18 @@
         "race": true,
         "https://braize.pajlada.com/chatterino/link_resolver": {
             "maintainer": "https://github.com/pajlada",
-            "path": "pajlada"
+            "path": "pajlada",
+            "health": "/chatterino"
         },
         "https://capi.mrchuw.com.br/link_resolver": {
             "maintainer": "https://github.com/mrchuw",
-            "path": "mrchuw"
+            "path": "mrchuw",
+            "health": "/"
+        },
+        "https://ch2api.ivr.fi/link_resolver": {
+            "maintainer": "https://www.twitch.tv/Leppunen",
+            "path": "leppunen",
+            "health": "/"
         }
     }
 }
