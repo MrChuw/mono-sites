@@ -60,10 +60,8 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	if hostname != "" {
 		candidateUpstreams = filterUnsupportedHostname(candidateUpstreams, hostname)
 
-		if len(candidateUpstreams) == 0 && upstreamParam != "" {
-			log.Printf("[PROXY] Requested upstream '%s' unsupported for '%s', falling back to all", upstreamParam, hostname)
-			allUpstreams := serviceCfg.Upstreams
-			candidateUpstreams = filterUnsupportedHostname(allUpstreams, hostname)
+		if len(candidateUpstreams) == 0 {
+			candidateUpstreams = filterUnsupportedHostname(serviceCfg.Upstreams, hostname)
 			isAll = true
 		}
 

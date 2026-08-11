@@ -43,14 +43,15 @@
             "maintainer": "https://github.com/pajlada",
             "path": "pajlada",
             "health": "/chatterino",
-            "unsupported": ["instagram", "facebook"]
+            "unsupported": ["instagram"]
         },
         "https://capi.mrchuw.com.br/link_resolver": {
             "maintainer": "https://github.com/mrchuw",
             "path": "mrchuw",
             "health": "/",
+            "unsupported": ["facebook"],
             "replace": {
-                "instagram.com": { "/p/": "/reels/" }
+                "instagram": { "/p/": "/reels/" }
             }
         },
         "https://ch2api.ivr.fi/link_resolver": {
