@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -26,9 +27,64 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	suffix, upstreamParam := buildSuffixAndGetUpstream(r, "/link_resolver")
+	originalURLParam := r.URL.Query().Get("url")
+	pathEmbedded := originalURLParam == ""
+	if pathEmbedded {
+		rawPath := strings.TrimPrefix(r.URL.EscapedPath(), "/link_resolver")
+		rawPath = strings.TrimPrefix(rawPath, "/")
+		originalURLParam = rawPath
+	}
 
+	var hostname string
+	if originalURLParam != "" {
+		decoded, err := url.QueryUnescape(originalURLParam)
+		if err == nil {
+			if parsed, err := url.Parse(decoded); err == nil && parsed.Host != "" {
+				hostname = parsed.Hostname()
+			}
+		}
+	}
+
+	suffix, upstreamParam := buildSuffixAndGetUpstream(r, "/link_resolver")
 	candidateUpstreams, isAll := selectUpstreams(serviceCfg, upstreamParam)
+
+	if hostname != "" {
+		candidateUpstreams = filterUnsupportedHostname(candidateUpstreams, hostname)
+
+		if len(candidateUpstreams) == 0 && upstreamParam != "" {
+			log.Printf("[PROXY] Requested upstream '%s' unsupported for '%s', falling back to all", upstreamParam, hostname)
+			allUpstreams := serviceCfg.Upstreams
+			candidateUpstreams = filterUnsupportedHostname(allUpstreams, hostname)
+			isAll = true
+		}
+
+		if len(candidateUpstreams) == 0 {
+			log.Printf("[PROXY] All upstreams unsupported for hostname '%s'", hostname)
+			http.Error(w, fmt.Sprintf("No upstream supports domain '%s'", hostname), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if hostname != "" {
+		bypassMap := parseBypassParams(r)
+		if bypassList, ok := bypassMap[strings.ToLower(hostname)]; ok && len(bypassList) > 0 {
+			filtered := filterBypassed(candidateUpstreams, bypassList)
+
+			if len(filtered) == 0 && upstreamParam != "" {
+				log.Printf("[PROXY] Requested upstream(s) '%s' bypassed for hostname '%s', falling back to all", upstreamParam, hostname)
+				allUpstreams := filterUnsupportedHostname(serviceCfg.Upstreams, hostname)
+				filtered = filterBypassed(allUpstreams, bypassList)
+				isAll = true
+			}
+
+			if len(filtered) == 0 {
+				log.Printf("[PROXY] All upstreams bypassed for hostname '%s'", hostname)
+				http.Error(w, fmt.Sprintf("All upstreams bypassed for domain '%s'", hostname), http.StatusBadRequest)
+				return
+			}
+			candidateUpstreams = filtered
+		}
+	}
 
 	var healthyCandidates []*config.Upstream
 	for _, u := range candidateUpstreams {
@@ -37,8 +93,8 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(healthyCandidates) == 0 && !isAll {
-		log.Printf("[PROXY] Selected upstreams offline, using all healthy")
-		for _, u := range serviceCfg.Upstreams {
+		log.Printf("[PROXY] Selected upstreams offline, falling back to all (filtered) candidates")
+		for _, u := range candidateUpstreams {
 			if u.IsHealthy() {
 				healthyCandidates = append(healthyCandidates, u)
 			}
@@ -69,13 +125,13 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if serviceCfg.Race {
-		h.executeRaceLinkResolver(w, r, healthyCandidates, suffix, bodyBytes, service, startTime)
+		h.executeRaceLinkResolver(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, service, startTime)
 		return
 	}
 
 	var lastError string
 	for _, upstream := range healthyCandidates {
-		target := buildTargetURL(upstream.URL, suffix)
+		target := buildTargetWithReplaces(upstream, originalURLParam, suffix, pathEmbedded, r)
 		var bodyReader io.Reader
 		if len(bodyBytes) > 0 {
 			bodyReader = strings.NewReader(string(bodyBytes))
@@ -104,11 +160,44 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, fmt.Sprintf("All upstreams for '%s' failed. Last error: %s", service, lastError), http.StatusBadGateway)
 }
 
-func errRequestWithContext(ctx context.Context, method, target string, body io.Reader) (*http.Request, error) {
-	return http.NewRequestWithContext(ctx, method, target, body)
+func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix string, pathEmbedded bool, r *http.Request) string {
+	decodedURL, err := url.QueryUnescape(originalURLParam)
+	if err != nil {
+		decodedURL = originalURLParam
+	}
+
+	replaceMap := parseReplaceParams(r)
+	mergedReplace := mergeReplaceMaps(upstream.Replace, replaceMap)
+	if len(mergedReplace) > 0 {
+		decodedURL = applyReplacesOnURL(decodedURL, mergedReplace)
+	}
+
+	encodedURL := url.QueryEscape(decodedURL)
+
+	cleanQuery := removeProxyParams(r.URL.Query())
+
+	if pathEmbedded {
+		newQuery := cleanQuery.Encode()
+		newSuffix := "/" + encodedURL
+		if newQuery != "" {
+			newSuffix += "?" + newQuery
+		}
+		return buildTargetURL(upstream.URL, newSuffix)
+	}
+
+	cleanQuery.Set("url", encodedURL)
+	newQuery := cleanQuery.Encode()
+
+	parsedSuffix, err := url.Parse(suffix)
+	if err != nil {
+		return buildTargetURL(upstream.URL, suffix)
+	}
+	parsedSuffix.RawQuery = newQuery
+	newSuffix := parsedSuffix.String()
+	return buildTargetURL(upstream.URL, newSuffix)
 }
 
-func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, service string, startTime time.Time) {
+func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, service string, startTime time.Time) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -119,7 +208,7 @@ func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request
 		wg.Add(1)
 		go func(u *config.Upstream) {
 			defer wg.Done()
-			target := buildTargetURL(u.URL, suffix)
+			target := buildTargetWithReplaces(u, originalURLParam, suffix, pathEmbedded, r)
 
 			var bodyReader io.Reader
 			if len(bodyBytes) > 0 {

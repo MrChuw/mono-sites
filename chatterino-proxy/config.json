@@ -42,12 +42,16 @@
         "https://braize.pajlada.com/chatterino/link_resolver": {
             "maintainer": "https://github.com/pajlada",
             "path": "pajlada",
-            "health": "/chatterino"
+            "health": "/chatterino",
+            "unsupported": ["instagram", "facebook"]
         },
         "https://capi.mrchuw.com.br/link_resolver": {
             "maintainer": "https://github.com/mrchuw",
             "path": "mrchuw",
-            "health": "/"
+            "health": "/",
+            "replace": {
+                "instagram.com": { "/p/": "/reels/" }
+            }
         },
         "https://ch2api.ivr.fi/link_resolver": {
             "maintainer": "https://www.twitch.tv/Leppunen",

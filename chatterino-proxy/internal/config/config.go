@@ -28,13 +28,15 @@ type ServiceConfig struct {
 }
 
 type Upstream struct {
-	URL            string                 `json:"url"`
-	Path           string                 `json:"path,omitempty"`
-	HealthEndpoint string                 `json:"healthEndpoint,omitempty"`
-	Description    string                 `json:"description,omitempty"`
-	Metadata       map[string]interface{} `json:"metadata"`
-	Healthy        bool                   `json:"healthy"`
-	Latency        time.Duration          `json:"latency"`
+	URL            string                       `json:"url"`
+	Path           string                       `json:"path,omitempty"`
+	HealthEndpoint string                       `json:"healthEndpoint,omitempty"`
+	Description    string                       `json:"description,omitempty"`
+	Metadata       map[string]interface{}       `json:"metadata"`
+	Healthy        bool                         `json:"healthy"`
+	Latency        time.Duration                `json:"latency"`
+	Unsupported    []string                     `json:"unsupported,omitempty"`
+	Replace        map[string]map[string]string `json:"replace,omitempty"`
 	mu             sync.RWMutex
 }
 
@@ -88,7 +90,7 @@ type Config struct {
 func NewConfig() *Config {
 	return &Config{
 		InstanceConfig: InstanceConfig{
-			UserAgent:         "chatterino-proxy/1.0.1",
+			UserAgent:         "chatterino-proxy/1.1.0",
 			HeartbeatInterval: 30,
 			Timeout:           30.0,
 			HealthTimeout:     5.0,
@@ -191,6 +193,36 @@ func (c *Config) Load(filePath string) error {
 							}
 						}
 
+						var unsupported []string
+						if val, ok := metadata["unsupported"]; ok {
+							if arr, ok := val.([]interface{}); ok {
+								for _, item := range arr {
+									if str, ok := item.(string); ok {
+										unsupported = append(unsupported, str)
+									}
+								}
+							}
+						}
+
+						replaceMap := make(map[string]map[string]string)
+						if val, ok := metadata["replace"]; ok {
+							if m, ok := val.(map[string]interface{}); ok {
+								for domain, rules := range m {
+									if rulesMap, ok := rules.(map[string]interface{}); ok {
+										inner := make(map[string]string)
+										for find, repl := range rulesMap {
+											if replStr, ok := repl.(string); ok {
+												inner[find] = replStr
+											}
+										}
+										if len(inner) > 0 {
+											replaceMap[domain] = inner
+										}
+									}
+								}
+							}
+						}
+
 						upstreams = append(upstreams, &Upstream{
 							URL:            targetURL,
 							Path:           pathVal,
@@ -198,6 +230,8 @@ func (c *Config) Load(filePath string) error {
 							Description:    descVal,
 							Metadata:       metadata,
 							Healthy:        true,
+							Unsupported:    unsupported,
+							Replace:        replaceMap,
 						})
 					}
 				}

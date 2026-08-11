@@ -67,7 +67,7 @@ Override with env `PROXY_CONFIG=/path/to/config.json`.
 | `maintainer`        | `""`                     | Instance maintainer                   |
 | `message`           | `""`                     | Custom message                        |
 | `description`       | `""`                     | Instance description                  |
-| `userAgent`         | `chatterino-proxy/1.0.1` | User‑Agent sent to upstreams          |
+| `userAgent`         | `chatterino-proxy/1.1.0` | User‑Agent sent to upstreams          |
 | `heartbeatInterval` | `30`                     | Health‑check interval (seconds)       |
 | `timeout`           | `30`                     | Upstream request timeout (seconds)    |
 | `healthTimeout`     | `5`                      | Health‑check timeout (seconds)        |
@@ -81,6 +81,8 @@ Each upstream object can contain:
 - `health` – custom health‑check endpoint (defaults to upstream URL)  
 - `description` – human‑readable description  
 - `maintainer` – upstream maintainer  
+- `unsupported` – list of keywords excluding this upstream from matching requests (exact username match on `/rm`, substring hostname match on `/link_resolver`) — see [Unsupported Identifiers](#unsupported-identifiers)  
+- `replace` – per‑domain path rewrite rules applied before forwarding. Link Resolver only — see [Dynamic URL Replace](#dynamic-url-replace-link-resolver-only)  
 - Any extra fields are preserved as metadata (visible in `/health`)
 
 ---
@@ -100,6 +102,55 @@ The proxy selects which upstream(s) to use based on the **query parameter** `cha
 - **Parameter stripping** – the `chatterino-proxy-upstream` parameter is **removed** before the request is forwarded to the upstream, so it does not interfere with the target API.
 
 - **Fallback** – if explicitly selected upstreams are all unhealthy, the proxy automatically falls back to all healthy upstreams.
+
+---
+
+## Bypassing Specific Upstreams
+
+The query parameter `chatterino-proxy-bypass` excludes one or more specific upstreams for a given identifier — a username on `/rm`, or a hostname on `/link_resolver`.
+
+- **Format** – `identifier,upstreamPath` (comma‑separated pairs). Multiple pairs can be chained in one value: `identifier1,upstream1,identifier2,upstream2`.
+- **Multiple parameters** – any query parameter whose name starts with `chatterino-proxy-bypass` (e.g. `chatterino-proxy-bypass2`) is also parsed and merged, so you can split bypass rules across several parameters if needed.
+- The bypass only applies when the identifier matches the current request (username for `/rm`, hostname for `/link_resolver`). Matching is case‑insensitive.
+- **Fallback** – if the explicitly requested upstream(s) (`chatterino-proxy-upstream`) end up being bypassed, the proxy automatically falls back to all other configured upstreams (still respecting `unsupported` and the bypass rule itself).
+- If bypassing removes every candidate upstream, even after the fallback, the proxy responds with `400 Bad Request`.
+
+**Examples**
+
+`GET /rm/RyanPotat?chatterino-proxy-bypass=RyanPotat,zonian`
+→ skips the `zonian` upstream for user `RyanPotat`.
+
+`GET /rm/RyanPotat?chatterino-proxy-upstream=zonian&chatterino-proxy-bypass=RyanPotat,zonian`
+→ `zonian` was both explicitly requested and bypassed, so the proxy falls back to all other upstreams.
+
+`GET /link_resolver/https://www.instagram.com/p/XYZ?chatterino-proxy-bypass=instagram.com,mrchuw`
+→ skips the `mrchuw` upstream for `instagram.com` links.
+
+---
+
+## Dynamic URL Replace (Link Resolver only)
+
+The query parameter `chatterino-proxy-replace` rewrites part of the target URL's path for a specific domain before the request is forwarded.
+
+- **Format** – `domain,find,replace` (comma‑separated triples). Multiple triples can be chained in one value: `domain1,find1,replace1,domain2,find2,replace2`.
+- **Multiple parameters** – any query parameter whose name starts with `chatterino-proxy-replace` (e.g. `chatterino-proxy-replace2`) is also parsed and merged.
+- Rules apply to the domain that best matches the target URL's host.
+- If an upstream also defines a static `replace` rule (in the config) for the same domain and `find` pattern, the value supplied via `chatterino-proxy-replace` takes precedence.
+
+**Example**
+
+`GET /link_resolver/https%3A%2F%2Fwww.instagram.com%2Fp%2FXYZ?chatterino-proxy-replace=instagram.com,/p/,/reel/`
+→ the path is rewritten to `/reel/XYZ` before forwarding.
+
+---
+
+## Unsupported Identifiers
+
+Upstreams can declare an `unsupported` list of keywords in the config, excluding them from requests that match a given identifier — a username on `/rm` (exact match), or a hostname on `/link_resolver` (matched as a case‑insensitive substring, e.g. `"unsupported": ["instagram", "facebook"]` matches `www.instagram.com`).
+
+- Any upstream whose `unsupported` list matches the identifier is skipped for that request.
+- If an explicitly requested upstream (`chatterino-proxy-upstream`) turns out to be unsupported for that identifier, the proxy automatically falls back to all other configured upstreams that do support it.
+- If every configured upstream is unsupported for the identifier, the proxy responds with `400 Bad Request`.
 
 ---
 
@@ -134,6 +185,12 @@ The `/health` endpoint exposes detailed status, including latency, health, and m
 
 **Link Resolver – explicit**  
 `GET /link_resolver/https://example.com?chatterino-proxy-upstream=pajlada`
+
+**Link Resolver – bypass an upstream for a domain**  
+`GET /link_resolver/https://www.instagram.com/p/XYZ?chatterino-proxy-bypass=instagram.com,mrchuw`
+
+**Link Resolver – dynamic path replace**  
+`GET /link_resolver/https%3A%2F%2Fwww.instagram.com%2Fp%2FXYZ?chatterino-proxy-replace=instagram.com,/p/,/reel/`
 
 **Health check**  
 `GET /health`

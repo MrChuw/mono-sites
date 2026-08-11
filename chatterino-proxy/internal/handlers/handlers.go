@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -197,9 +199,179 @@ func selectUpstreams(cfg *config.ServiceConfig, upstreamParam string) (selected 
 		if u, ok := pathMap[p]; ok {
 			result = append(result, u)
 		} else {
-			log.Printf("Upstream desconhecido '%s' no parâmetro, usando todos", p)
+			log.Printf("Unknown upstream '%s' in parameter, using all", p)
 			return cfg.Upstreams, true
 		}
 	}
 	return result, false
+}
+
+func parseBypassParams(r *http.Request) map[string][]string {
+	bypassMap := make(map[string][]string)
+
+	if val := r.URL.Query().Get("chatterino-proxy-bypass"); val != "" {
+		parseBypassValue(val, bypassMap)
+	}
+
+	for key, vals := range r.URL.Query() {
+		if strings.HasPrefix(key, "chatterino-proxy-bypass") && key != "chatterino-proxy-bypass" {
+			for _, val := range vals {
+				parseBypassValue(val, bypassMap)
+			}
+		}
+	}
+
+	return bypassMap
+}
+
+func parseBypassValue(val string, m map[string][]string) {
+	parts := strings.Split(val, ",")
+	for i := 0; i+1 < len(parts); i += 2 {
+		ident := strings.ToLower(strings.TrimSpace(parts[i]))
+		upstream := strings.TrimSpace(parts[i+1])
+		if ident != "" && upstream != "" {
+			m[ident] = append(m[ident], upstream)
+		}
+	}
+}
+
+func filterBypassed(upstreams []*config.Upstream, bypassList []string) []*config.Upstream {
+	filtered := make([]*config.Upstream, 0, len(upstreams))
+	for _, u := range upstreams {
+		if !slices.Contains(bypassList, u.Path) {
+			filtered = append(filtered, u)
+		}
+	}
+	return filtered
+}
+
+func filterUnsupported(upstreams []*config.Upstream, identifier string) []*config.Upstream {
+	if identifier == "" {
+		return upstreams
+	}
+	filtered := make([]*config.Upstream, 0, len(upstreams))
+	for _, u := range upstreams {
+		skip := false
+		for _, uns := range u.Unsupported {
+			if strings.EqualFold(uns, identifier) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, u)
+		}
+	}
+	return filtered
+}
+
+func filterUnsupportedHostname(upstreams []*config.Upstream, hostname string) []*config.Upstream {
+	if hostname == "" {
+		return upstreams
+	}
+	lowerHost := strings.ToLower(hostname)
+	filtered := make([]*config.Upstream, 0, len(upstreams))
+	for _, u := range upstreams {
+		skip := false
+		for _, uns := range u.Unsupported {
+			if uns == "" {
+				continue
+			}
+			if strings.Contains(lowerHost, strings.ToLower(uns)) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, u)
+		}
+	}
+	return filtered
+}
+
+func parseReplaceParams(r *http.Request) map[string]map[string]string {
+	replaceMap := make(map[string]map[string]string)
+
+	if val := r.URL.Query().Get("chatterino-proxy-replace"); val != "" {
+		parseReplaceValue(val, replaceMap)
+	}
+
+	for key, vals := range r.URL.Query() {
+		if strings.HasPrefix(key, "chatterino-proxy-replace") && key != "chatterino-proxy-replace" {
+			for _, val := range vals {
+				parseReplaceValue(val, replaceMap)
+			}
+		}
+	}
+
+	return replaceMap
+}
+
+func mergeReplaceMaps(static, dynamic map[string]map[string]string) map[string]map[string]string {
+	merged := make(map[string]map[string]string)
+	for domain, rules := range static {
+		merged[domain] = make(map[string]string, len(rules))
+		for find, repl := range rules {
+			merged[domain][find] = repl
+		}
+	}
+	for domain, rules := range dynamic {
+		if _, ok := merged[domain]; !ok {
+			merged[domain] = make(map[string]string, len(rules))
+		}
+		for find, repl := range rules {
+			merged[domain][find] = repl
+		}
+	}
+	return merged
+}
+
+func parseReplaceValue(val string, m map[string]map[string]string) {
+	parts := strings.Split(val, ",")
+	for i := 0; i+2 < len(parts); i += 3 {
+		domain := strings.TrimSpace(parts[i])
+		find := strings.TrimSpace(parts[i+1])
+		repl := strings.TrimSpace(parts[i+2])
+		if domain != "" && find != "" {
+			if _, ok := m[domain]; !ok {
+				m[domain] = make(map[string]string)
+			}
+			m[domain][find] = repl
+		}
+	}
+}
+
+func applyReplacesOnURL(rawURL string, replaces map[string]map[string]string) string {
+	if len(replaces) == 0 {
+		return rawURL
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	host := parsed.Hostname()
+	var bestDomain string
+	for domain := range replaces {
+		if strings.Contains(host, domain) || strings.Contains(host, "."+domain) || host == domain {
+			if len(domain) > len(bestDomain) {
+				bestDomain = domain
+			}
+		}
+	}
+	if bestDomain != "" {
+		for find, repl := range replaces[bestDomain] {
+			parsed.Path = strings.ReplaceAll(parsed.Path, find, repl)
+		}
+	}
+	return parsed.String()
+}
+
+func removeProxyParams(query url.Values) url.Values {
+	newQuery := url.Values{}
+	for key, values := range query {
+		if !strings.HasPrefix(key, "chatterino-proxy-") {
+			newQuery[key] = values
+		}
+	}
+	return newQuery
 }

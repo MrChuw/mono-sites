@@ -26,20 +26,27 @@ func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	path := strings.TrimPrefix(r.URL.Path, "/rm")
+	path = strings.TrimPrefix(path, "/")
+	segments := strings.Split(path, "/")
+	username := ""
+	if len(segments) > 0 && segments[0] != "" {
+		username = strings.ToLower(segments[0])
+	}
+
 	rawPath := strings.TrimPrefix(r.URL.EscapedPath(), "/rm")
 	rawPath = strings.TrimPrefix(rawPath, "/")
-
-	segments := strings.Split(rawPath, "/")
-	for i, seg := range segments {
+	segments2 := strings.Split(rawPath, "/")
+	for i, seg := range segments2 {
 		if seg != "" && !strings.Contains(seg, "?") {
-			segments[i] = strings.ToLower(seg)
+			segments2[i] = strings.ToLower(seg)
 		}
 	}
-	rawPathLower := strings.Join(segments, "/")
+	rawPathLower := strings.Join(segments2, "/")
 
 	query := r.URL.Query()
 	upstreamParam := query.Get(upstreamQueryParam)
-	query.Del(upstreamQueryParam)
+	query = removeProxyParams(query)
 	newQuery := query.Encode()
 
 	suffix := "/" + rawPathLower
@@ -49,6 +56,36 @@ func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 
 	candidateUpstreams, isAll := selectUpstreams(serviceCfg, upstreamParam)
 
+	if username != "" {
+		candidateUpstreams = filterUnsupported(candidateUpstreams, username)
+		if len(candidateUpstreams) == 0 {
+			log.Printf("[PROXY] All upstreams unsupported for user '%s'", username)
+			http.Error(w, fmt.Sprintf("All upstreams unsupported for user '%s'", username), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if username != "" {
+		bypassMap := parseBypassParams(r)
+		if bypassList, ok := bypassMap[username]; ok && len(bypassList) > 0 {
+			filtered := filterBypassed(candidateUpstreams, bypassList)
+
+			if len(filtered) == 0 && upstreamParam != "" {
+				log.Printf("[PROXY] Requested upstream(s) '%s' bypassed for user '%s', falling back to all", upstreamParam, username)
+				allUpstreams := filterUnsupported(serviceCfg.Upstreams, username)
+				filtered = filterBypassed(allUpstreams, bypassList)
+				isAll = true
+			}
+
+			if len(filtered) == 0 {
+				log.Printf("[PROXY] All upstreams bypassed for user '%s'", username)
+				http.Error(w, fmt.Sprintf("All upstreams bypassed for user '%s'", username), http.StatusBadRequest)
+				return
+			}
+			candidateUpstreams = filtered
+		}
+	}
+
 	var healthyCandidates []*config.Upstream
 	for _, u := range candidateUpstreams {
 		if u.IsHealthy() {
@@ -56,8 +93,8 @@ func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(healthyCandidates) == 0 && !isAll {
-		log.Printf("[PROXY] Selected upstreams offline, using all healthy")
-		for _, u := range serviceCfg.Upstreams {
+		log.Printf("[PROXY] Selected upstreams offline, falling back to all (filtered) candidates")
+		for _, u := range candidateUpstreams {
 			if u.IsHealthy() {
 				healthyCandidates = append(healthyCandidates, u)
 			}
