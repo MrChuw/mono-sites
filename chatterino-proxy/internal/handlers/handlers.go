@@ -116,10 +116,10 @@ func writeResponse(w http.ResponseWriter, resp *http.Response, upstreamURL strin
 		return
 	}
 
-	var jsonMap map[string]interface{}
+	var jsonMap map[string]any
 	if jsonErr := json.Unmarshal(respBody, &jsonMap); jsonErr == nil {
 		jsonMap["proxy_instance"] = upstreamURL
-		jsonMap["proxy_elapsed"] = map[string]interface{}{
+		jsonMap["proxy_elapsed"] = map[string]any{
 			"ms": elapsedMs,
 			"s":  elapsedSec,
 		}

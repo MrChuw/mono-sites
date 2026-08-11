@@ -16,7 +16,7 @@ func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
 		serviceList = append(serviceList, k)
 	}
 
-	response := map[string]interface{}{
+	response := map[string]any{
 		"status":             "proxy running",
 		"description":        h.Config.InstanceConfig.Description,
 		"maintainer":         h.Config.InstanceConfig.Maintainer,

@@ -8,3 +8,7 @@ Mostly smoll sites, and any bigger will probably get its own repo and then added
 ## [UploadServer](https://github.com/MrChuw/mono-sites/blob/master/uploadserver/README.md)
 
 A minimal replacement for [Save-server](https://github.com/Neztore/save-server). Made to be used behind caddy + file server
+
+## [Chatterino-Proxy](https://github.com/MrChuw/mono-sites/blob/master/chatterino-proxy/README.md)
+
+A proxy inspiread by [Best-logs](https://github.com/ZonianMidian/best-logs). Because I want to host my on chatterino api with larger previews.

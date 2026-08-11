@@ -32,7 +32,7 @@ type Upstream struct {
 	Path           string                       `json:"path,omitempty"`
 	HealthEndpoint string                       `json:"healthEndpoint,omitempty"`
 	Description    string                       `json:"description,omitempty"`
-	Metadata       map[string]interface{}       `json:"metadata"`
+	Metadata       map[string]any               `json:"metadata"`
 	Healthy        bool                         `json:"healthy"`
 	Latency        time.Duration                `json:"latency"`
 	Unsupported    []string                     `json:"unsupported,omitempty"`
@@ -90,7 +90,7 @@ type Config struct {
 func NewConfig() *Config {
 	return &Config{
 		InstanceConfig: InstanceConfig{
-			UserAgent:         "chatterino-proxy/1.1.0",
+			UserAgent:         "chatterino-proxy/1.1.1",
 			HeartbeatInterval: 30,
 			Timeout:           30.0,
 			HealthTimeout:     5.0,
@@ -168,7 +168,7 @@ func (c *Config) Load(filePath string) error {
 					continue
 				}
 
-				var metadata map[string]interface{}
+				var metadata map[string]any
 				if err := json.Unmarshal(subRaw, &metadata); err == nil {
 					targetURL := subKey
 					if strings.TrimSpace(targetURL) != "" {
@@ -195,7 +195,7 @@ func (c *Config) Load(filePath string) error {
 
 						var unsupported []string
 						if val, ok := metadata["unsupported"]; ok {
-							if arr, ok := val.([]interface{}); ok {
+							if arr, ok := val.([]any); ok {
 								for _, item := range arr {
 									if str, ok := item.(string); ok {
 										unsupported = append(unsupported, str)
@@ -206,9 +206,9 @@ func (c *Config) Load(filePath string) error {
 
 						replaceMap := make(map[string]map[string]string)
 						if val, ok := metadata["replace"]; ok {
-							if m, ok := val.(map[string]interface{}); ok {
+							if m, ok := val.(map[string]any); ok {
 								for domain, rules := range m {
-									if rulesMap, ok := rules.(map[string]interface{}); ok {
+									if rulesMap, ok := rules.(map[string]any); ok {
 										inner := make(map[string]string)
 										for find, repl := range rulesMap {
 											if replStr, ok := repl.(string); ok {

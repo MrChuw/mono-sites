@@ -11,14 +11,14 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 
 	services := h.Config.GetServices()
-	servicesStatus := make(map[string]interface{})
+	servicesStatus := make(map[string]any)
 
 	totalUpstreams := 0
 	totalHealthy := 0
 
 	for name, serviceCfg := range services {
 		healthyCount := 0
-		var upstreamsList []map[string]interface{}
+		var upstreamsList []map[string]any
 
 		for _, u := range serviceCfg.Upstreams {
 			healthy := u.IsHealthy()
@@ -26,7 +26,7 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 				healthyCount++
 			}
 
-			upstreamData := map[string]interface{}{
+			upstreamData := map[string]any{
 				"url":         u.URL,
 				"path":        u.Path,
 				"description": u.Description,
@@ -41,7 +41,7 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		totalUpstreams += len(serviceCfg.Upstreams)
 		totalHealthy += healthyCount
 
-		servicesStatus[name] = map[string]interface{}{
+		servicesStatus[name] = map[string]any{
 			"race_enabled": serviceCfg.Race,
 			"total":        len(serviceCfg.Upstreams),
 			"healthy":      healthyCount,
@@ -49,7 +49,7 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	status := map[string]interface{}{
+	status := map[string]any{
 		"status":             "ok",
 		"description":        h.Config.InstanceConfig.Description,
 		"maintainer":         h.Config.InstanceConfig.Maintainer,

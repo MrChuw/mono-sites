@@ -67,7 +67,7 @@ Override with env `PROXY_CONFIG=/path/to/config.json`.
 | `maintainer`        | `""`                     | Instance maintainer                   |
 | `message`           | `""`                     | Custom message                        |
 | `description`       | `""`                     | Instance description                  |
-| `userAgent`         | `chatterino-proxy/1.1.0` | User‑Agent sent to upstreams          |
+| `userAgent`         | `chatterino-proxy/1.1.1` | User‑Agent sent to upstreams          |
 | `heartbeatInterval` | `30`                     | Health‑check interval (seconds)       |
 | `timeout`           | `30`                     | Upstream request timeout (seconds)    |
 | `healthTimeout`     | `5`                      | Health‑check timeout (seconds)        |
@@ -218,7 +218,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./config.json:/app/config.json:ro
+      - ./config.json:/config.json:ro
     environment:
       - PROXY_CONFIG=/config/config.json   # optional
       - PORT=8080                          # optional, default 8000

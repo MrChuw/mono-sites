@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +16,10 @@ import (
 	"time"
 
 	"proxy/internal/config"
+	"proxy/internal/utils"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 )
 
 func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
@@ -36,9 +43,11 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var hostname string
+	var originalDecodedURL string
 	if originalURLParam != "" {
 		decoded, err := url.QueryUnescape(originalURLParam)
 		if err == nil {
+			originalDecodedURL = decoded
 			if parsed, err := url.Parse(decoded); err == nil && parsed.Host != "" {
 				hostname = parsed.Hostname()
 			}
@@ -125,7 +134,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if serviceCfg.Race {
-		h.executeRaceLinkResolver(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, service, startTime)
+		h.executeRaceLinkResolver(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
 		return
 	}
 
@@ -149,7 +158,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode < 400 {
 			log.Printf("[PROXY] Service: %s | Status: %d | Time: %v | Upstream: %s", service, resp.StatusCode, time.Since(startTime), upstream.URL)
-			writeResponse(w, resp, upstream.URL, startTime)
+			writeLinkResolverResponse(w, resp, upstream.URL, startTime, originalDecodedURL)
 			return
 		}
 		resp.Body.Close()
@@ -197,7 +206,7 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 	return buildTargetURL(upstream.URL, newSuffix)
 }
 
-func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, service string, startTime time.Time) {
+func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, service string, startTime time.Time) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -247,7 +256,7 @@ func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request
 	for res := range results {
 		if res.resp != nil {
 			log.Printf("[RACE-WIN] Service: %s | Status: %d | Time: %v | Winner: %s", service, res.resp.StatusCode, time.Since(startTime), res.upstreamURL)
-			writeResponse(w, res.resp, res.upstreamURL, startTime)
+			writeLinkResolverResponse(w, res.resp, res.upstreamURL, startTime, originalDecodedURL)
 			return
 		}
 		if res.err != nil {
@@ -257,4 +266,105 @@ func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request
 
 	log.Printf("[RACE-FAIL] All parallel upstreams failed for '%s' | Last Error: %v", service, lastErr)
 	http.Error(w, fmt.Sprintf("All parallel upstreams failed for '%s'. Last error: %v", service, lastErr), http.StatusBadGateway)
+}
+
+func writeLinkResolverResponse(w http.ResponseWriter, resp *http.Response, upstreamURL string, startTime time.Time, originalURL string) {
+	defer resp.Body.Close()
+
+	elapsedDuration := time.Since(startTime)
+	elapsedMs := float64(elapsedDuration.Microseconds()) / 1000.0
+	elapsedSec := elapsedDuration.Seconds()
+
+	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
+
+	for k, vv := range resp.Header {
+		lowerK := strings.ToLower(k)
+		if utils.HopByHopHeaders[lowerK] || lowerK == "content-length" || lowerK == "transfer-encoding" {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+
+	w.Header().Set("X-Proxy-Instance", upstreamURL)
+	w.Header().Set("X-Proxy-Time", fmt.Sprintf("%.2fms", elapsedMs))
+
+	var reader io.Reader = resp.Body
+
+	switch encoding {
+	case "gzip":
+		gzReader, gzErr := gzip.NewReader(resp.Body)
+		if gzErr == nil {
+			defer gzReader.Close()
+			reader = gzReader
+		}
+	case "zstd":
+		zReader, zErr := zstd.NewReader(resp.Body)
+		if zErr == nil {
+			defer zReader.Close()
+			reader = zReader
+		}
+	case "br":
+		reader = brotli.NewReader(resp.Body)
+	}
+
+	respBody, err := io.ReadAll(reader)
+	if err != nil {
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+
+	var jsonMap map[string]any
+	if jsonErr := json.Unmarshal(respBody, &jsonMap); jsonErr == nil {
+		if originalURL != "" {
+			if _, hasLink := jsonMap["link"]; hasLink {
+				jsonMap["link"] = originalURL
+			}
+		}
+
+		jsonMap["proxy_instance"] = upstreamURL
+		jsonMap["proxy_elapsed"] = map[string]any{
+			"ms": elapsedMs,
+			"s":  elapsedSec,
+		}
+
+		buf := &bytes.Buffer{}
+		encoder := json.NewEncoder(buf)
+		encoder.SetEscapeHTML(false)
+
+		if marshalErr := encoder.Encode(jsonMap); marshalErr == nil {
+			modifiedJSON := buf.Bytes()
+
+			var compressedBuf bytes.Buffer
+			var compressErr error
+
+			switch encoding {
+			case "gzip":
+				gzWriter := gzip.NewWriter(&compressedBuf)
+				_, compressErr = gzWriter.Write(modifiedJSON)
+				_ = gzWriter.Close()
+			case "zstd":
+				zWriter, _ := zstd.NewWriter(&compressedBuf)
+				_, compressErr = zWriter.Write(modifiedJSON)
+				_ = zWriter.Close()
+			case "br":
+				brWriter := brotli.NewWriter(&compressedBuf)
+				_, compressErr = brWriter.Write(modifiedJSON)
+				_ = brWriter.Close()
+			default:
+				compressedBuf.Write(modifiedJSON)
+			}
+
+			if compressErr == nil {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(compressedBuf.Bytes())
+				return
+			}
+		}
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
 }
