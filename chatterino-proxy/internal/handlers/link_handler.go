@@ -10,7 +10,9 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,81 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 )
+
+var sizeLimitRegex = regexp.MustCompile(`(?i)too large\s*\(>\s*(\d+)\s*MB\)`)
+
+type linkRaceResult struct {
+	upstreamURL string
+	statusCode  int
+	header      http.Header
+	body        []byte
+	err         error
+}
+
+type linkCacheEntry struct {
+	mu        sync.RWMutex
+	expiresAt time.Time
+	upstreams map[string]*linkRaceResult
+}
+
+var globalLinkCache sync.Map
+
+func buildCacheKey(originalURL string, r *http.Request) string {
+	if originalURL == "" {
+		return ""
+	}
+
+	cleanQuery := removeProxyParams(r.URL.Query())
+	sortedParams := cleanQuery.Encode()
+
+	if sortedParams != "" {
+		return originalURL + "|" + sortedParams
+	}
+
+	return originalURL
+}
+
+func getLinkCacheEntry(cacheKey string) *linkCacheEntry {
+	if cacheKey == "" {
+		return nil
+	}
+	v, ok := globalLinkCache.Load(cacheKey)
+	if !ok {
+		entry := &linkCacheEntry{
+			expiresAt: time.Now().Add(1 * time.Minute),
+			upstreams: make(map[string]*linkRaceResult),
+		}
+		v, _ = globalLinkCache.LoadOrStore(cacheKey, entry)
+		return v.(*linkCacheEntry)
+	}
+	entry := v.(*linkCacheEntry)
+
+	entry.mu.RLock()
+	expired := time.Now().After(entry.expiresAt)
+	entry.mu.RUnlock()
+
+	if expired {
+		entry.mu.Lock()
+		if time.Now().After(entry.expiresAt) {
+			entry.upstreams = make(map[string]*linkRaceResult)
+			entry.expiresAt = time.Now().Add(1 * time.Minute)
+		}
+		entry.mu.Unlock()
+	}
+	return entry
+}
+
+func cacheResult(cacheKey string, res *linkRaceResult) {
+	if cacheKey == "" || res == nil || res.body == nil {
+		return
+	}
+	entry := getLinkCacheEntry(cacheKey)
+	if entry != nil {
+		entry.mu.Lock()
+		entry.upstreams[res.upstreamURL] = res
+		entry.mu.Unlock()
+	}
+}
 
 func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -61,12 +138,10 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 
 	if hostname != "" {
 		candidateUpstreams = filterUnsupportedHostname(candidateUpstreams, hostname)
-
 		if len(candidateUpstreams) == 0 {
 			candidateUpstreams = filterUnsupportedHostname(serviceCfg.Upstreams, hostname)
 			isAll = true
 		}
-
 		if len(candidateUpstreams) == 0 {
 			log.Printf("[PROXY] All upstreams unsupported for hostname '%s'", hostname)
 			http.Error(w, fmt.Sprintf("No upstream supports domain '%s'", hostname), http.StatusBadRequest)
@@ -103,6 +178,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 			healthyCandidates = append(healthyCandidates, u)
 		}
 	}
+
 	if len(healthyCandidates) == 0 && !isAll && fallbackEnabled {
 		log.Printf("[PROXY] Requested upstream(s) '%s' offline, chatterino-proxy-fallback enabled, falling back to all", upstreamParam)
 		fallbackCandidates := filterUnsupportedHostname(serviceCfg.Upstreams, hostname)
@@ -118,12 +194,16 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(healthyCandidates) == 0 {
 		log.Printf("[PROXY] No healthy upstreams for '%s'", service)
-		http.Error(w, fmt.Sprintf("No healthy upstreams available for '%s'", service), http.StatusBadGateway)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  500,
+			"message": fmt.Sprintf("No healthy upstreams available for '%s'", service),
+		})
 		return
 	}
 
 	explicitAttempt := !isAll
-
 	if !serviceCfg.Race && isAll {
 		sort.SliceStable(healthyCandidates, func(i, j int) bool {
 			return healthyCandidates[i].GetLatency() < healthyCandidates[j].GetLatency()
@@ -143,14 +223,47 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 
 	var success bool
 	var lastError string
+	var lastAppResp *linkRaceResult
 
-	if serviceCfg.Race {
-		success, lastError = h.tryLinkResolverRace(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
+	cacheKey := buildCacheKey(originalDecodedURL, r)
+	cacheEntry := getLinkCacheEntry(cacheKey)
+	var candidatesToFetch []*config.Upstream
+
+	if cacheEntry != nil {
+		cacheEntry.mu.RLock()
+		for _, u := range healthyCandidates {
+			if res, ok := cacheEntry.upstreams[u.URL]; ok {
+				if ok, _ := isLinkResolverSuccess(res.statusCode, res.body); ok {
+					cacheEntry.mu.RUnlock()
+					log.Printf("[CACHE-WIN] Service: %s | Time: %v | Winner: %s", service, time.Since(startTime), res.upstreamURL)
+					writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
+					return
+				}
+				lastAppResp = pickBetterErrorResp(lastAppResp, res)
+			} else {
+				candidatesToFetch = append(candidatesToFetch, u)
+			}
+		}
+		cacheEntry.mu.RUnlock()
 	} else {
-		success, lastError = h.tryLinkResolverSequential(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
+		candidatesToFetch = healthyCandidates
 	}
-	if success {
-		return
+
+	if len(candidatesToFetch) > 0 {
+		var fetchAppResp *linkRaceResult
+		if serviceCfg.Race {
+			success, lastError, fetchAppResp = h.tryLinkResolverRace(w, r, candidatesToFetch, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, cacheKey, service, startTime)
+		} else {
+			success, lastError, fetchAppResp = h.tryLinkResolverSequential(w, r, candidatesToFetch, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, cacheKey, service, startTime)
+		}
+		if success {
+			return
+		}
+		if fetchAppResp != nil {
+			lastAppResp = pickBetterErrorResp(lastAppResp, fetchAppResp)
+		}
+	} else {
+		lastError = "all requested candidates were cached as failures"
 	}
 
 	if explicitAttempt && fallbackEnabled {
@@ -168,16 +281,55 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if len(fallbackHealthy) > 0 {
-			log.Printf("[PROXY] Requested upstream(s) '%s' failed for '%s' (%s), chatterino-proxy-fallback enabled, racing remaining upstreams", upstreamParam, service, lastError)
-			success, lastError = h.tryLinkResolverRace(w, r, fallbackHealthy, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
-			if success {
-				return
+			var fallbackCandidatesToFetch []*config.Upstream
+
+			if cacheEntry != nil {
+				cacheEntry.mu.RLock()
+				for _, u := range fallbackHealthy {
+					if res, ok := cacheEntry.upstreams[u.URL]; ok {
+						if ok, _ := isLinkResolverSuccess(res.statusCode, res.body); ok {
+							cacheEntry.mu.RUnlock()
+							log.Printf("[CACHE-FALLBACK-WIN] Service: %s | Time: %v | Winner: %s", service, time.Since(startTime), res.upstreamURL)
+							writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
+							return
+						}
+						lastAppResp = pickBetterErrorResp(lastAppResp, res)
+					} else {
+						fallbackCandidatesToFetch = append(fallbackCandidatesToFetch, u)
+					}
+				}
+				cacheEntry.mu.RUnlock()
+			} else {
+				fallbackCandidatesToFetch = fallbackHealthy
+			}
+
+			if len(fallbackCandidatesToFetch) > 0 {
+				log.Printf("[PROXY] Requested upstream(s) '%s' failed for '%s' (%s), chatterino-proxy-fallback enabled, racing remaining upstreams", upstreamParam, service, lastError)
+				var fbAppResp *linkRaceResult
+				success, lastError, fbAppResp = h.tryLinkResolverRace(w, r, fallbackCandidatesToFetch, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, cacheKey, service, startTime)
+				if success {
+					return
+				}
+				if fbAppResp != nil {
+					lastAppResp = pickBetterErrorResp(lastAppResp, fbAppResp)
+				}
 			}
 		}
 	}
 
+	if lastAppResp != nil && lastAppResp.body != nil {
+		log.Printf("[PROXY-FAIL] All upstreams failed for '%s' | Returning last upstream application error | Last Error: %s", service, lastError)
+		writeLinkResolverResponse(w, lastAppResp.header, lastAppResp.statusCode, lastAppResp.body, lastAppResp.upstreamURL, startTime, originalDecodedURL)
+		return
+	}
+
 	log.Printf("[PROXY-FAIL] All upstreams failed for '%s' | Last Error: %s", service, lastError)
-	http.Error(w, fmt.Sprintf("All upstreams for '%s' failed. Last error: %s", service, lastError), http.StatusBadGateway)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  500,
+		"message": fmt.Sprintf("All upstreams for '%s' failed. Last error: %s", service, lastError),
+	})
 }
 
 func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix string, pathEmbedded bool, r *http.Request) string {
@@ -193,7 +345,6 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 	}
 
 	encodedURL := url.QueryEscape(decodedURL)
-
 	cleanQuery := removeProxyParams(r.URL.Query())
 
 	if pathEmbedded {
@@ -217,14 +368,6 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 	return buildTargetURL(upstream.URL, newSuffix)
 }
 
-type linkRaceResult struct {
-	upstreamURL string
-	statusCode  int
-	header      http.Header
-	body        []byte
-	err         error
-}
-
 func extractDecompressedBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
 	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
@@ -245,7 +388,18 @@ func extractDecompressedBody(resp *http.Response) ([]byte, error) {
 		reader = brotli.NewReader(resp.Body)
 	}
 
-	return io.ReadAll(reader)
+	const maxResponseSize = 50 << 20
+
+	body, err := io.ReadAll(io.LimitReader(reader, maxResponseSize+1))
+	if err != nil {
+		return nil, err
+	}
+
+	if len(body) > maxResponseSize {
+		return nil, fmt.Errorf("response too large (>10MB)")
+	}
+
+	return body, nil
 }
 
 func isLinkResolverSuccess(statusCode int, body []byte) (bool, string) {
@@ -268,8 +422,10 @@ func isLinkResolverSuccess(statusCode int, body []byte) (bool, string) {
 	return true, ""
 }
 
-func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, service string, startTime time.Time) (bool, string) {
+func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, cacheKey string, service string, startTime time.Time) (bool, string, *linkRaceResult) {
 	var lastError string
+	var lastAppResp *linkRaceResult
+
 	for _, upstream := range upstreams {
 		target := buildTargetWithReplaces(upstream, originalURLParam, suffix, pathEmbedded, r)
 		var bodyReader io.Reader
@@ -295,17 +451,29 @@ func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Reque
 		}
 
 		if ok, failReason := isLinkResolverSuccess(resp.StatusCode, respBody); ok {
+			res := &linkRaceResult{upstreamURL: upstream.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+			cacheResult(cacheKey, res)
+
 			log.Printf("[PROXY] Service: %s | Status: %d | Time: %v | Upstream: %s", service, resp.StatusCode, time.Since(startTime), upstream.URL)
 			writeLinkResolverResponse(w, resp.Header, resp.StatusCode, respBody, upstream.URL, startTime, originalDecodedURL)
-			return true, ""
+			return true, "", nil
 		} else {
 			lastError = fmt.Sprintf("%s (%s)", failReason, upstream.URL)
+
+			currentAppResp := &linkRaceResult{
+				upstreamURL: upstream.URL,
+				statusCode:  resp.StatusCode,
+				header:      resp.Header,
+				body:        respBody,
+			}
+			cacheResult(cacheKey, currentAppResp)
+			lastAppResp = pickBetterErrorResp(lastAppResp, currentAppResp)
 		}
 	}
-	return false, lastError
+	return false, lastError, lastAppResp
 }
 
-func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, service string, startTime time.Time) (bool, string) {
+func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, cacheKey string, service string, startTime time.Time) (bool, string, *linkRaceResult) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
@@ -344,9 +512,13 @@ func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, up
 			}
 
 			if ok, failReason := isLinkResolverSuccess(resp.StatusCode, respBody); ok {
-				results <- linkRaceResult{upstreamURL: u.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+				res := linkRaceResult{upstreamURL: u.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+				cacheResult(cacheKey, &res)
+				results <- res
 			} else {
-				results <- linkRaceResult{err: fmt.Errorf("%s (%s)", failReason, u.URL)}
+				res := linkRaceResult{err: fmt.Errorf("%s (%s)", failReason, u.URL), upstreamURL: u.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+				cacheResult(cacheKey, &res)
+				results <- res
 			}
 		}(upstream)
 	}
@@ -357,19 +529,26 @@ func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, up
 	}()
 
 	var lastErr error
+	var lastAppResp *linkRaceResult
+
 	for res := range results {
 		if res.err == nil {
 			log.Printf("[RACE-WIN] Service: %s | Status: %d | Time: %v | Winner: %s", service, res.statusCode, time.Since(startTime), res.upstreamURL)
 			writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
-			return true, ""
+			return true, "", nil
 		}
 		lastErr = res.err
+
+		if res.body != nil {
+			resCopy := res
+			lastAppResp = pickBetterErrorResp(lastAppResp, &resCopy)
+		}
 	}
 
 	if lastErr != nil {
-		return false, lastErr.Error()
+		return false, lastErr.Error(), lastAppResp
 	}
-	return false, ""
+	return false, "", lastAppResp
 }
 
 func isFallbackEnabled(r *http.Request) bool {
@@ -440,4 +619,44 @@ func writeLinkResolverResponse(w http.ResponseWriter, header http.Header, status
 
 	w.WriteHeader(statusCode)
 	w.Write(body)
+}
+
+func extractSizeLimitFromBody(body []byte) int {
+	if len(body) == 0 {
+		return -1
+	}
+	var jsonMap map[string]any
+	if err := json.Unmarshal(body, &jsonMap); err == nil {
+		if msg, ok := jsonMap["message"].(string); ok {
+			matches := sizeLimitRegex.FindStringSubmatch(msg)
+			if len(matches) == 2 {
+				if val, err := strconv.Atoi(matches[1]); err == nil {
+					return val
+				}
+			}
+		}
+	}
+	return -1
+}
+
+func pickBetterErrorResp(a, b *linkRaceResult) *linkRaceResult {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+
+	sizeA := extractSizeLimitFromBody(a.body)
+	sizeB := extractSizeLimitFromBody(b.body)
+
+	if sizeA > -1 || sizeB > -1 {
+		if sizeA > sizeB {
+			return a
+		}
+		if sizeB > sizeA {
+			return b
+		}
+	}
+	return b
 }
