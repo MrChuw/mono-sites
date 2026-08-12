@@ -54,6 +54,8 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	fallbackEnabled := isFallbackEnabled(r)
+
 	suffix, upstreamParam := buildSuffixAndGetUpstream(r, "/link_resolver")
 	candidateUpstreams, isAll := selectUpstreams(serviceCfg, upstreamParam)
 
@@ -72,9 +74,11 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var bypassList []string
 	if hostname != "" {
 		bypassMap := parseBypassParams(r)
-		if bypassList, ok := bypassMap[strings.ToLower(hostname)]; ok && len(bypassList) > 0 {
+		bypassList = bypassMap[strings.ToLower(hostname)]
+		if len(bypassList) > 0 {
 			filtered := filterBypassed(candidateUpstreams, bypassList)
 
 			if len(filtered) == 0 && upstreamParam != "" {
@@ -99,9 +103,13 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 			healthyCandidates = append(healthyCandidates, u)
 		}
 	}
-	if len(healthyCandidates) == 0 && !isAll {
-		log.Printf("[PROXY] Selected upstreams offline, falling back to all (filtered) candidates")
-		for _, u := range candidateUpstreams {
+	if len(healthyCandidates) == 0 && !isAll && fallbackEnabled {
+		log.Printf("[PROXY] Requested upstream(s) '%s' offline, chatterino-proxy-fallback enabled, falling back to all", upstreamParam)
+		fallbackCandidates := filterUnsupportedHostname(serviceCfg.Upstreams, hostname)
+		if len(bypassList) > 0 {
+			fallbackCandidates = filterBypassed(fallbackCandidates, bypassList)
+		}
+		for _, u := range fallbackCandidates {
 			if u.IsHealthy() {
 				healthyCandidates = append(healthyCandidates, u)
 			}
@@ -113,6 +121,8 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("No healthy upstreams available for '%s'", service), http.StatusBadGateway)
 		return
 	}
+
+	explicitAttempt := !isAll
 
 	if !serviceCfg.Race && isAll {
 		sort.SliceStable(healthyCandidates, func(i, j int) bool {
@@ -131,36 +141,39 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var success bool
+	var lastError string
+
 	if serviceCfg.Race {
-		h.executeRaceLinkResolver(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
+		success, lastError = h.tryLinkResolverRace(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
+	} else {
+		success, lastError = h.tryLinkResolverSequential(w, r, healthyCandidates, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
+	}
+	if success {
 		return
 	}
 
-	var lastError string
-	for _, upstream := range healthyCandidates {
-		target := buildTargetWithReplaces(upstream, originalURLParam, suffix, pathEmbedded, r)
-		var bodyReader io.Reader
-		if len(bodyBytes) > 0 {
-			bodyReader = strings.NewReader(string(bodyBytes))
+	if explicitAttempt && fallbackEnabled {
+		fallbackCandidates := filterUnsupportedHostname(serviceCfg.Upstreams, hostname)
+		if len(bypassList) > 0 {
+			fallbackCandidates = filterBypassed(fallbackCandidates, bypassList)
 		}
-		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bodyReader)
-		if err != nil {
-			lastError = err.Error()
-			continue
+		fallbackCandidates = excludeUpstreams(fallbackCandidates, healthyCandidates)
+
+		var fallbackHealthy []*config.Upstream
+		for _, u := range fallbackCandidates {
+			if u.IsHealthy() {
+				fallbackHealthy = append(fallbackHealthy, u)
+			}
 		}
-		copyHeaders(r.Header, outReq.Header, h.Config.InstanceConfig.UserAgent)
-		resp, err := h.Client.Do(outReq)
-		if err != nil {
-			lastError = err.Error()
-			continue
+
+		if len(fallbackHealthy) > 0 {
+			log.Printf("[PROXY] Requested upstream(s) '%s' failed for '%s' (%s), chatterino-proxy-fallback enabled, racing remaining upstreams", upstreamParam, service, lastError)
+			success, lastError = h.tryLinkResolverRace(w, r, fallbackHealthy, suffix, bodyBytes, originalURLParam, pathEmbedded, originalDecodedURL, service, startTime)
+			if success {
+				return
+			}
 		}
-		if resp.StatusCode < 400 {
-			log.Printf("[PROXY] Service: %s | Status: %d | Time: %v | Upstream: %s", service, resp.StatusCode, time.Since(startTime), upstream.URL)
-			writeLinkResolverResponse(w, resp, upstream.URL, startTime, originalDecodedURL)
-			return
-		}
-		resp.Body.Close()
-		lastError = fmt.Sprintf("Status %d", resp.StatusCode)
 	}
 
 	log.Printf("[PROXY-FAIL] All upstreams failed for '%s' | Last Error: %s", service, lastError)
@@ -204,11 +217,99 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 	return buildTargetURL(upstream.URL, newSuffix)
 }
 
-func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, service string, startTime time.Time) {
+type linkRaceResult struct {
+	upstreamURL string
+	statusCode  int
+	header      http.Header
+	body        []byte
+	err         error
+}
+
+func extractDecompressedBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
+
+	var reader io.Reader = resp.Body
+	switch encoding {
+	case "gzip":
+		if gzReader, err := gzip.NewReader(resp.Body); err == nil {
+			defer gzReader.Close()
+			reader = gzReader
+		}
+	case "zstd":
+		if zReader, err := zstd.NewReader(resp.Body); err == nil {
+			defer zReader.Close()
+			reader = zReader
+		}
+	case "br":
+		reader = brotli.NewReader(resp.Body)
+	}
+
+	return io.ReadAll(reader)
+}
+
+func isLinkResolverSuccess(statusCode int, body []byte) (bool, string) {
+	if statusCode >= 400 {
+		return false, fmt.Sprintf("status %d", statusCode)
+	}
+
+	var jsonMap map[string]any
+	if err := json.Unmarshal(body, &jsonMap); err == nil {
+		if rawStatus, ok := jsonMap["status"]; ok {
+			if statusNum, ok := rawStatus.(float64); ok && statusNum >= 400 {
+				if msg, ok := jsonMap["message"].(string); ok && msg != "" {
+					return false, fmt.Sprintf("status %d: %s", int(statusNum), msg)
+				}
+				return false, fmt.Sprintf("status %d", int(statusNum))
+			}
+		}
+	}
+
+	return true, ""
+}
+
+func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, service string, startTime time.Time) (bool, string) {
+	var lastError string
+	for _, upstream := range upstreams {
+		target := buildTargetWithReplaces(upstream, originalURLParam, suffix, pathEmbedded, r)
+		var bodyReader io.Reader
+		if len(bodyBytes) > 0 {
+			bodyReader = strings.NewReader(string(bodyBytes))
+		}
+		outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bodyReader)
+		if err != nil {
+			lastError = fmt.Sprintf("invalid request (%s)", upstream.URL)
+			continue
+		}
+		copyHeaders(r.Header, outReq.Header, h.Config.InstanceConfig.UserAgent)
+		resp, err := h.Client.Do(outReq)
+		if err != nil {
+			lastError = fmt.Sprintf("connection error (%s)", upstream.URL)
+			continue
+		}
+
+		respBody, readErr := extractDecompressedBody(resp)
+		if readErr != nil {
+			lastError = fmt.Sprintf("read error (%s)", upstream.URL)
+			continue
+		}
+
+		if ok, failReason := isLinkResolverSuccess(resp.StatusCode, respBody); ok {
+			log.Printf("[PROXY] Service: %s | Status: %d | Time: %v | Upstream: %s", service, resp.StatusCode, time.Since(startTime), upstream.URL)
+			writeLinkResolverResponse(w, resp.Header, resp.StatusCode, respBody, upstream.URL, startTime, originalDecodedURL)
+			return true, ""
+		} else {
+			lastError = fmt.Sprintf("%s (%s)", failReason, upstream.URL)
+		}
+	}
+	return false, lastError
+}
+
+func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, upstreams []*config.Upstream, suffix string, bodyBytes []byte, originalURLParam string, pathEmbedded bool, originalDecodedURL string, service string, startTime time.Time) (bool, string) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	results := make(chan raceResult, len(upstreams))
+	results := make(chan linkRaceResult, len(upstreams))
 	var wg sync.WaitGroup
 
 	for _, upstream := range upstreams {
@@ -224,7 +325,7 @@ func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request
 
 			outReq, err := http.NewRequestWithContext(ctx, r.Method, target, bodyReader)
 			if err != nil {
-				results <- raceResult{err: err}
+				results <- linkRaceResult{err: fmt.Errorf("invalid request (%s)", u.URL)}
 				return
 			}
 
@@ -232,15 +333,20 @@ func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request
 
 			resp, err := h.Client.Do(outReq)
 			if err != nil {
-				results <- raceResult{err: err}
+				results <- linkRaceResult{err: fmt.Errorf("connection error (%s)", u.URL)}
 				return
 			}
 
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				results <- raceResult{resp: resp, upstreamURL: u.URL}
+			respBody, readErr := extractDecompressedBody(resp)
+			if readErr != nil {
+				results <- linkRaceResult{err: fmt.Errorf("read error (%s)", u.URL)}
+				return
+			}
+
+			if ok, failReason := isLinkResolverSuccess(resp.StatusCode, respBody); ok {
+				results <- linkRaceResult{upstreamURL: u.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
 			} else {
-				resp.Body.Close()
-				results <- raceResult{err: fmt.Errorf("status %d from %s", resp.StatusCode, target)}
+				results <- linkRaceResult{err: fmt.Errorf("%s (%s)", failReason, u.URL)}
 			}
 		}(upstream)
 	}
@@ -252,32 +358,50 @@ func (h *Handler) executeRaceLinkResolver(w http.ResponseWriter, r *http.Request
 
 	var lastErr error
 	for res := range results {
-		if res.resp != nil {
-			log.Printf("[RACE-WIN] Service: %s | Status: %d | Time: %v | Winner: %s", service, res.resp.StatusCode, time.Since(startTime), res.upstreamURL)
-			writeLinkResolverResponse(w, res.resp, res.upstreamURL, startTime, originalDecodedURL)
-			return
+		if res.err == nil {
+			log.Printf("[RACE-WIN] Service: %s | Status: %d | Time: %v | Winner: %s", service, res.statusCode, time.Since(startTime), res.upstreamURL)
+			writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
+			return true, ""
 		}
-		if res.err != nil {
-			lastErr = res.err
-		}
+		lastErr = res.err
 	}
 
-	log.Printf("[RACE-FAIL] All parallel upstreams failed for '%s' | Last Error: %v", service, lastErr)
-	http.Error(w, fmt.Sprintf("All parallel upstreams failed for '%s'. Last error: %v", service, lastErr), http.StatusBadGateway)
+	if lastErr != nil {
+		return false, lastErr.Error()
+	}
+	return false, ""
 }
 
-func writeLinkResolverResponse(w http.ResponseWriter, resp *http.Response, upstreamURL string, startTime time.Time, originalURL string) {
-	defer resp.Body.Close()
+func isFallbackEnabled(r *http.Request) bool {
+	val := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("chatterino-proxy-fallback")))
+	return val == "true" || val == "1" || val == "yes"
+}
 
+func excludeUpstreams(upstreams []*config.Upstream, exclude []*config.Upstream) []*config.Upstream {
+	if len(exclude) == 0 {
+		return upstreams
+	}
+	skip := make(map[*config.Upstream]bool, len(exclude))
+	for _, u := range exclude {
+		skip[u] = true
+	}
+	filtered := make([]*config.Upstream, 0, len(upstreams))
+	for _, u := range upstreams {
+		if !skip[u] {
+			filtered = append(filtered, u)
+		}
+	}
+	return filtered
+}
+
+func writeLinkResolverResponse(w http.ResponseWriter, header http.Header, statusCode int, body []byte, upstreamURL string, startTime time.Time, originalURL string) {
 	elapsedDuration := time.Since(startTime)
 	elapsedMs := float64(elapsedDuration.Microseconds()) / 1000.0
 	elapsedSec := elapsedDuration.Seconds()
 
-	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
-
-	for k, vv := range resp.Header {
+	for k, vv := range header {
 		lowerK := strings.ToLower(k)
-		if utils.HopByHopHeaders[lowerK] || lowerK == "content-length" || lowerK == "transfer-encoding" {
+		if utils.HopByHopHeaders[lowerK] || lowerK == "content-length" || lowerK == "transfer-encoding" || lowerK == "content-encoding" {
 			continue
 		}
 		for _, v := range vv {
@@ -288,33 +412,8 @@ func writeLinkResolverResponse(w http.ResponseWriter, resp *http.Response, upstr
 	w.Header().Set("X-Proxy-Instance", upstreamURL)
 	w.Header().Set("X-Proxy-Time", fmt.Sprintf("%.2fms", elapsedMs))
 
-	var reader io.Reader = resp.Body
-
-	switch encoding {
-	case "gzip":
-		gzReader, gzErr := gzip.NewReader(resp.Body)
-		if gzErr == nil {
-			defer gzReader.Close()
-			reader = gzReader
-		}
-	case "zstd":
-		zReader, zErr := zstd.NewReader(resp.Body)
-		if zErr == nil {
-			defer zReader.Close()
-			reader = zReader
-		}
-	case "br":
-		reader = brotli.NewReader(resp.Body)
-	}
-
-	respBody, err := io.ReadAll(reader)
-	if err != nil {
-		w.WriteHeader(resp.StatusCode)
-		return
-	}
-
 	var jsonMap map[string]any
-	if jsonErr := json.Unmarshal(respBody, &jsonMap); jsonErr == nil {
+	if jsonErr := json.Unmarshal(body, &jsonMap); jsonErr == nil {
 		if originalURL != "" {
 			if _, hasLink := jsonMap["link"]; hasLink {
 				jsonMap["link"] = originalURL
@@ -332,37 +431,13 @@ func writeLinkResolverResponse(w http.ResponseWriter, resp *http.Response, upstr
 		encoder.SetEscapeHTML(false)
 
 		if marshalErr := encoder.Encode(jsonMap); marshalErr == nil {
-			modifiedJSON := buf.Bytes()
-
-			var compressedBuf bytes.Buffer
-			var compressErr error
-
-			switch encoding {
-			case "gzip":
-				gzWriter := gzip.NewWriter(&compressedBuf)
-				_, compressErr = gzWriter.Write(modifiedJSON)
-				_ = gzWriter.Close()
-			case "zstd":
-				zWriter, _ := zstd.NewWriter(&compressedBuf)
-				_, compressErr = zWriter.Write(modifiedJSON)
-				_ = zWriter.Close()
-			case "br":
-				brWriter := brotli.NewWriter(&compressedBuf)
-				_, compressErr = brWriter.Write(modifiedJSON)
-				_ = brWriter.Close()
-			default:
-				compressedBuf.Write(modifiedJSON)
-			}
-
-			if compressErr == nil {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(resp.StatusCode)
-				w.Write(compressedBuf.Bytes())
-				return
-			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(statusCode)
+			w.Write(buf.Bytes())
+			return
 		}
 	}
 
-	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
+	w.WriteHeader(statusCode)
+	w.Write(body)
 }

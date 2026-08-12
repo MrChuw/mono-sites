@@ -67,7 +67,7 @@ Override with env `PROXY_CONFIG=/path/to/config.json`.
 | `maintainer`        | `""`                     | Instance maintainer                   |
 | `message`           | `""`                     | Custom message                        |
 | `description`       | `""`                     | Instance description                  |
-| `userAgent`         | `chatterino-proxy/1.1.2` | User‑Agent sent to upstreams          |
+| `userAgent`         | `chatterino-proxy/1.1.3` | User‑Agent sent to upstreams          |
 | `heartbeatInterval` | `30`                     | Health‑check interval (seconds)       |
 | `timeout`           | `30`                     | Upstream request timeout (seconds)    |
 | `healthTimeout`     | `5`                      | Health‑check timeout (seconds)        |
@@ -154,6 +154,22 @@ Upstreams can declare an `unsupported` list of keywords in the config, excluding
 
 ---
 
+## Fallback on Failure (Link Resolver only)
+
+By default, when `chatterino-proxy-upstream` explicitly selects one or more upstreams, the proxy only tries those — if they fail, it gives up. The query parameter `chatterino-proxy-fallback=true` changes that: if the explicitly requested upstream(s) fail, the proxy automatically races all other configured upstreams (still respecting `unsupported`, `bypass`, and `replace`) and returns the first one that succeeds.
+
+- **Format** – `chatterino-proxy-fallback=true` (also accepts `1` or `yes`, case‑insensitive). Any other value, or omitting the parameter, keeps the default behavior (only the requested upstream is tried).
+- A failure includes both a failed request (network error, non‑2xx/3xx HTTP status) and an upstream that responds with HTTP 200 but embeds an error status in its JSON body (some upstreams do this).
+- The fallback round always races the remaining upstreams concurrently, regardless of the service's `race` setting.
+- This only applies when `chatterino-proxy-upstream` was used to explicitly select upstream(s). It has no effect when no upstream is specified (or `all` is used), since all upstreams are already tried in that case.
+
+**Example**
+
+`GET /link_resolver/https://example.com?chatterino-proxy-upstream=mrchuw&chatterino-proxy-fallback=true`
+→ if `mrchuw` fails, the proxy races the other configured upstreams and returns the first successful response.
+
+---
+
 ## Link Resolver
 
 Works identically to `/rm`. Upstreams are configured under `link_resolverInstances`.  
@@ -191,6 +207,9 @@ The `/health` endpoint exposes detailed status, including latency, health, and m
 
 **Link Resolver – dynamic path replace**  
 `GET /link_resolver/https%3A%2F%2Fwww.instagram.com%2Fp%2FXYZ?chatterino-proxy-replace=instagram.com,/p/,/reel/`
+
+**Link Resolver – fallback to other upstreams on failure**  
+`GET /link_resolver/https://example.com?chatterino-proxy-upstream=mrchuw&chatterino-proxy-fallback=true`
 
 **Health check**  
 `GET /health`
