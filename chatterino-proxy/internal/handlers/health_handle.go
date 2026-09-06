@@ -49,18 +49,9 @@ func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	status := map[string]any{
-		"status":             "ok",
-		"description":        h.Config.InstanceConfig.Description,
-		"maintainer":         h.Config.InstanceConfig.Maintainer,
-		"message":            h.Config.InstanceConfig.Message,
-		"user_agent":         h.Config.InstanceConfig.UserAgent,
-		"global_race":        h.Config.InstanceConfig.Race,
-		"heartbeat_interval": h.Config.InstanceConfig.HeartbeatInterval,
-		"timeout":            h.Config.InstanceConfig.Timeout,
-		"health_timeout":     h.Config.InstanceConfig.HealthTimeout,
-		"services":           servicesStatus,
-	}
+	status := baseInstanceFields(h.Config)
+	status["status"] = "ok"
+	status["services"] = servicesStatus
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(status); err != nil {

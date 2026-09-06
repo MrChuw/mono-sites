@@ -14,6 +14,10 @@ import (
 	"proxy/internal/config"
 )
 
+func trimRMPrefix(path string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(path, "/rm"), "/")
+}
+
 func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
 	service := "rm"
@@ -26,21 +30,17 @@ func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	path := strings.TrimPrefix(r.URL.Path, "/rm")
-	path = strings.TrimPrefix(path, "/")
+	path := trimRMPrefix(r.URL.Path)
 	segments := strings.Split(path, "/")
 	username := ""
 	if len(segments) > 0 && segments[0] != "" {
 		username = strings.ToLower(segments[0])
 	}
 
-	rawPath := strings.TrimPrefix(r.URL.EscapedPath(), "/rm")
-	rawPath = strings.TrimPrefix(rawPath, "/")
+	rawPath := trimRMPrefix(r.URL.EscapedPath())
 	segments2 := strings.Split(rawPath, "/")
 	for i, seg := range segments2 {
-		if seg != "" && !strings.Contains(seg, "?") {
-			segments2[i] = strings.ToLower(seg)
-		}
+		segments2[i] = strings.ToLower(seg)
 	}
 	rawPathLower := strings.Join(segments2, "/")
 
@@ -65,9 +65,11 @@ func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var bypassList []string
 	if username != "" {
 		bypassMap := parseBypassParams(r)
-		if bypassList, ok := bypassMap[username]; ok && len(bypassList) > 0 {
+		if list, ok := bypassMap[username]; ok && len(list) > 0 {
+			bypassList = list
 			filtered := filterBypassed(candidateUpstreams, bypassList)
 
 			if len(filtered) == 0 && upstreamParam != "" {
@@ -93,8 +95,12 @@ func (h *Handler) RMHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(healthyCandidates) == 0 && !isAll {
-		log.Printf("[PROXY] Selected upstreams offline, falling back to all (filtered) candidates")
-		for _, u := range candidateUpstreams {
+		log.Printf("[PROXY] Selected upstreams offline, falling back to all upstreams")
+		fallbackCandidates := filterUnsupported(serviceCfg.Upstreams, username)
+		if len(bypassList) > 0 {
+			fallbackCandidates = filterBypassed(fallbackCandidates, bypassList)
+		}
+		for _, u := range fallbackCandidates {
 			if u.IsHealthy() {
 				healthyCandidates = append(healthyCandidates, u)
 			}

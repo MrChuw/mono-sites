@@ -16,18 +16,9 @@ func (h *Handler) RootHandler(w http.ResponseWriter, r *http.Request) {
 		serviceList = append(serviceList, k)
 	}
 
-	response := map[string]any{
-		"status":             "proxy running",
-		"description":        h.Config.InstanceConfig.Description,
-		"maintainer":         h.Config.InstanceConfig.Maintainer,
-		"message":            h.Config.InstanceConfig.Message,
-		"services":           serviceList,
-		"user_agent":         h.Config.InstanceConfig.UserAgent,
-		"global_race":        h.Config.InstanceConfig.Race,
-		"heartbeat_interval": h.Config.InstanceConfig.HeartbeatInterval,
-		"timeout":            h.Config.InstanceConfig.Timeout,
-		"health_timeout":     h.Config.InstanceConfig.HealthTimeout,
-	}
+	response := baseInstanceFields(h.Config)
+	response["status"] = "proxy running"
+	response["services"] = serviceList
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {

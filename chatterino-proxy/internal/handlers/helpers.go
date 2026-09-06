@@ -69,46 +69,122 @@ func copyHeaders(src, dst http.Header, userAgent string) {
 	dst.Set("User-Agent", userAgent)
 }
 
-func writeResponse(w http.ResponseWriter, resp *http.Response, upstreamURL string, startTime time.Time) {
-	defer resp.Body.Close()
+// shared by writeResponse and writeLinkResolverResponse in link_handler.go
+func elapsedTiming(startTime time.Time) (ms float64, sec float64) {
+	d := time.Since(startTime)
+	return float64(d.Microseconds()) / 1000.0, d.Seconds()
+}
 
-	elapsedDuration := time.Since(startTime)
-	elapsedMs := float64(elapsedDuration.Microseconds()) / 1000.0
-	elapsedSec := elapsedDuration.Seconds()
-
-	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
-
-	for k, vv := range resp.Header {
+// shared by writeResponse and writeLinkResolverResponse
+func copyResponseHeaders(w http.ResponseWriter, src http.Header, extraExclude ...string) {
+	excluded := make(map[string]bool, len(extraExclude))
+	for _, e := range extraExclude {
+		excluded[strings.ToLower(e)] = true
+	}
+	for k, vv := range src {
 		lowerK := strings.ToLower(k)
-		if utils.HopByHopHeaders[lowerK] || lowerK == "content-length" || lowerK == "transfer-encoding" {
+		if utils.HopByHopHeaders[lowerK] || lowerK == "content-length" || lowerK == "transfer-encoding" || excluded[lowerK] {
 			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
+}
 
+// shared by writeResponse and extractDecompressedBody in link_handler.go
+func decompressBody(body io.ReadCloser, encoding string) (io.Reader, func()) {
+	switch strings.ToLower(encoding) {
+	case "gzip":
+		if r, err := gzip.NewReader(body); err == nil {
+			return r, func() { r.Close() }
+		}
+	case "zstd":
+		if r, err := zstd.NewReader(body); err == nil {
+			return r, func() { r.Close() }
+		}
+	case "br":
+		return brotli.NewReader(body), func() {}
+	}
+	return body, func() {}
+}
+
+func recompressBody(data []byte, encoding string) ([]byte, bool) {
+	var buf bytes.Buffer
+	var err error
+	switch encoding {
+	case "gzip":
+		gw := gzip.NewWriter(&buf)
+		_, err = gw.Write(data)
+		_ = gw.Close()
+	case "zstd":
+		zw, _ := zstd.NewWriter(&buf)
+		_, err = zw.Write(data)
+		_ = zw.Close()
+	case "br":
+		bw := brotli.NewWriter(&buf)
+		_, err = bw.Write(data)
+		_ = bw.Close()
+	default:
+		buf.Write(data)
+	}
+	if err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// unmarshals body, lets mutate() adjust it, stamps proxy_instance/proxy_elapsed,
+// and re-encodes. Shared by writeResponse and writeLinkResolverResponse.
+func augmentJSONBody(body []byte, upstreamURL string, elapsedMs, elapsedSec float64, mutate func(map[string]any)) ([]byte, bool) {
+	var jsonMap map[string]any
+	if err := json.Unmarshal(body, &jsonMap); err != nil {
+		return nil, false
+	}
+	if mutate != nil {
+		mutate(jsonMap)
+	}
+	jsonMap["proxy_instance"] = upstreamURL
+	jsonMap["proxy_elapsed"] = map[string]any{
+		"ms": elapsedMs,
+		"s":  elapsedSec,
+	}
+
+	buf := &bytes.Buffer{}
+	encoder := json.NewEncoder(buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(jsonMap); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+// shared by RootHandler and HealthHandler
+func baseInstanceFields(cfg *config.Config) map[string]any {
+	return map[string]any{
+		"description":        cfg.InstanceConfig.Description,
+		"maintainer":         cfg.InstanceConfig.Maintainer,
+		"message":            cfg.InstanceConfig.Message,
+		"user_agent":         cfg.InstanceConfig.UserAgent,
+		"global_race":        cfg.InstanceConfig.Race,
+		"heartbeat_interval": cfg.InstanceConfig.HeartbeatInterval,
+		"timeout":            cfg.InstanceConfig.Timeout,
+		"health_timeout":     cfg.InstanceConfig.HealthTimeout,
+	}
+}
+
+func writeResponse(w http.ResponseWriter, resp *http.Response, upstreamURL string, startTime time.Time) {
+	defer resp.Body.Close()
+
+	elapsedMs, elapsedSec := elapsedTiming(startTime)
+	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
+
+	copyResponseHeaders(w, resp.Header)
 	w.Header().Set("X-Proxy-Instance", upstreamURL)
 	w.Header().Set("X-Proxy-Time", fmt.Sprintf("%.2fms", elapsedMs))
 
-	var reader io.Reader = resp.Body
-
-	switch encoding {
-	case "gzip":
-		gzReader, gzErr := gzip.NewReader(resp.Body)
-		if gzErr == nil {
-			defer gzReader.Close()
-			reader = gzReader
-		}
-	case "zstd":
-		zReader, zErr := zstd.NewReader(resp.Body)
-		if zErr == nil {
-			defer zReader.Close()
-			reader = zReader
-		}
-	case "br":
-		reader = brotli.NewReader(resp.Body)
-	}
+	reader, closeReader := decompressBody(resp.Body, encoding)
+	defer closeReader()
 
 	respBody, err := io.ReadAll(reader)
 	if err != nil {
@@ -116,47 +192,12 @@ func writeResponse(w http.ResponseWriter, resp *http.Response, upstreamURL strin
 		return
 	}
 
-	var jsonMap map[string]any
-	if jsonErr := json.Unmarshal(respBody, &jsonMap); jsonErr == nil {
-		jsonMap["proxy_instance"] = upstreamURL
-		jsonMap["proxy_elapsed"] = map[string]any{
-			"ms": elapsedMs,
-			"s":  elapsedSec,
-		}
-
-		buf := &bytes.Buffer{}
-		encoder := json.NewEncoder(buf)
-		encoder.SetEscapeHTML(false)
-
-		if marshalErr := encoder.Encode(jsonMap); marshalErr == nil {
-			modifiedJSON := buf.Bytes()
-
-			var compressedBuf bytes.Buffer
-			var compressErr error
-
-			switch encoding {
-			case "gzip":
-				gzWriter := gzip.NewWriter(&compressedBuf)
-				_, compressErr = gzWriter.Write(modifiedJSON)
-				_ = gzWriter.Close()
-			case "zstd":
-				zWriter, _ := zstd.NewWriter(&compressedBuf)
-				_, compressErr = zWriter.Write(modifiedJSON)
-				_ = zWriter.Close()
-			case "br":
-				brWriter := brotli.NewWriter(&compressedBuf)
-				_, compressErr = brWriter.Write(modifiedJSON)
-				_ = brWriter.Close()
-			default:
-				compressedBuf.Write(modifiedJSON)
-			}
-
-			if compressErr == nil {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(resp.StatusCode)
-				w.Write(compressedBuf.Bytes())
-				return
-			}
+	if modifiedJSON, ok := augmentJSONBody(respBody, upstreamURL, elapsedMs, elapsedSec, nil); ok {
+		if compressed, ok := recompressBody(modifiedJSON, encoding); ok {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(compressed)
+			return
 		}
 	}
 

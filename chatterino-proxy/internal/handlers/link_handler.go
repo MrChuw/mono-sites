@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,10 +16,6 @@ import (
 	"time"
 
 	"proxy/internal/config"
-	"proxy/internal/utils"
-
-	"github.com/andybalholm/brotli"
-	"github.com/klauspost/compress/zstd"
 )
 
 var sizeLimitRegex = regexp.MustCompile(`(?i)too large\s*\(>\s*(\d+)\s*MB\)`)
@@ -32,6 +26,7 @@ type linkRaceResult struct {
 	header      http.Header
 	body        []byte
 	err         error
+	replaced    bool
 }
 
 type linkCacheEntry struct {
@@ -236,7 +231,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 				if ok, _ := isLinkResolverSuccess(res.statusCode, res.body); ok {
 					cacheEntry.mu.RUnlock()
 					log.Printf("[CACHE-WIN] Service: %s | Time: %v | Winner: %s", service, time.Since(startTime), res.upstreamURL)
-					writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
+					writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL, res.replaced)
 					return
 				}
 				lastAppResp = pickBetterErrorResp(lastAppResp, res)
@@ -290,7 +285,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 						if ok, _ := isLinkResolverSuccess(res.statusCode, res.body); ok {
 							cacheEntry.mu.RUnlock()
 							log.Printf("[CACHE-FALLBACK-WIN] Service: %s | Time: %v | Winner: %s", service, time.Since(startTime), res.upstreamURL)
-							writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
+							writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL, res.replaced)
 							return
 						}
 						lastAppResp = pickBetterErrorResp(lastAppResp, res)
@@ -319,7 +314,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 
 	if lastAppResp != nil && lastAppResp.body != nil {
 		log.Printf("[PROXY-FAIL] All upstreams failed for '%s' | Returning last upstream application error | Last Error: %s", service, lastError)
-		writeLinkResolverResponse(w, lastAppResp.header, lastAppResp.statusCode, lastAppResp.body, lastAppResp.upstreamURL, startTime, originalDecodedURL)
+		writeLinkResolverResponse(w, lastAppResp.header, lastAppResp.statusCode, lastAppResp.body, lastAppResp.upstreamURL, startTime, originalDecodedURL, lastAppResp.replaced)
 		return
 	}
 
@@ -332,7 +327,7 @@ func (h *Handler) LinkResolverHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix string, pathEmbedded bool, r *http.Request) string {
+func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix string, pathEmbedded bool, r *http.Request) (string, bool) {
 	decodedURL, err := url.QueryUnescape(originalURLParam)
 	if err != nil {
 		decodedURL = originalURLParam
@@ -340,8 +335,13 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 
 	replaceMap := parseReplaceParams(r)
 	mergedReplace := mergeReplaceMaps(upstream.Replace, replaceMap)
+	replaced := false
 	if len(mergedReplace) > 0 {
-		decodedURL = applyReplacesOnURL(decodedURL, mergedReplace)
+		newURL := applyReplacesOnURL(decodedURL, mergedReplace)
+		if newURL != decodedURL {
+			decodedURL = newURL
+			replaced = true
+		}
 	}
 
 	encodedURL := url.QueryEscape(decodedURL)
@@ -353,7 +353,7 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 		if newQuery != "" {
 			newSuffix += "?" + newQuery
 		}
-		return buildTargetURL(upstream.URL, newSuffix)
+		return buildTargetURL(upstream.URL, newSuffix), replaced
 	}
 
 	cleanQuery.Set("url", encodedURL)
@@ -361,32 +361,18 @@ func buildTargetWithReplaces(upstream *config.Upstream, originalURLParam, suffix
 
 	parsedSuffix, err := url.Parse(suffix)
 	if err != nil {
-		return buildTargetURL(upstream.URL, suffix)
+		return buildTargetURL(upstream.URL, suffix), replaced
 	}
 	parsedSuffix.RawQuery = newQuery
 	newSuffix := parsedSuffix.String()
-	return buildTargetURL(upstream.URL, newSuffix)
+	return buildTargetURL(upstream.URL, newSuffix), replaced
 }
 
 func extractDecompressedBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
 	encoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
-
-	var reader io.Reader = resp.Body
-	switch encoding {
-	case "gzip":
-		if gzReader, err := gzip.NewReader(resp.Body); err == nil {
-			defer gzReader.Close()
-			reader = gzReader
-		}
-	case "zstd":
-		if zReader, err := zstd.NewReader(resp.Body); err == nil {
-			defer zReader.Close()
-			reader = zReader
-		}
-	case "br":
-		reader = brotli.NewReader(resp.Body)
-	}
+	reader, closeReader := decompressBody(resp.Body, encoding)
+	defer closeReader()
 
 	const maxResponseSize = 50 << 20
 
@@ -427,7 +413,7 @@ func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Reque
 	var lastAppResp *linkRaceResult
 
 	for _, upstream := range upstreams {
-		target := buildTargetWithReplaces(upstream, originalURLParam, suffix, pathEmbedded, r)
+		target, didReplace := buildTargetWithReplaces(upstream, originalURLParam, suffix, pathEmbedded, r)
 		var bodyReader io.Reader
 		if len(bodyBytes) > 0 {
 			bodyReader = strings.NewReader(string(bodyBytes))
@@ -451,11 +437,17 @@ func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Reque
 		}
 
 		if ok, failReason := isLinkResolverSuccess(resp.StatusCode, respBody); ok {
-			res := &linkRaceResult{upstreamURL: upstream.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+			res := &linkRaceResult{
+				upstreamURL: upstream.URL,
+				statusCode:  resp.StatusCode,
+				header:      resp.Header,
+				body:        respBody,
+				replaced:    didReplace,
+			}
 			cacheResult(cacheKey, res)
 
 			log.Printf("[PROXY] Service: %s | Status: %d | Time: %v | Upstream: %s", service, resp.StatusCode, time.Since(startTime), upstream.URL)
-			writeLinkResolverResponse(w, resp.Header, resp.StatusCode, respBody, upstream.URL, startTime, originalDecodedURL)
+			writeLinkResolverResponse(w, resp.Header, resp.StatusCode, respBody, upstream.URL, startTime, originalDecodedURL, res.replaced)
 			return true, "", nil
 		} else {
 			lastError = fmt.Sprintf("%s (%s)", failReason, upstream.URL)
@@ -465,6 +457,7 @@ func (h *Handler) tryLinkResolverSequential(w http.ResponseWriter, r *http.Reque
 				statusCode:  resp.StatusCode,
 				header:      resp.Header,
 				body:        respBody,
+				replaced:    didReplace,
 			}
 			cacheResult(cacheKey, currentAppResp)
 			lastAppResp = pickBetterErrorResp(lastAppResp, currentAppResp)
@@ -484,7 +477,7 @@ func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, up
 		wg.Add(1)
 		go func(u *config.Upstream) {
 			defer wg.Done()
-			target := buildTargetWithReplaces(u, originalURLParam, suffix, pathEmbedded, r)
+			target, didReplace := buildTargetWithReplaces(u, originalURLParam, suffix, pathEmbedded, r)
 
 			var bodyReader io.Reader
 			if len(bodyBytes) > 0 {
@@ -512,11 +505,23 @@ func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, up
 			}
 
 			if ok, failReason := isLinkResolverSuccess(resp.StatusCode, respBody); ok {
-				res := linkRaceResult{upstreamURL: u.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+				res := linkRaceResult{
+					upstreamURL: u.URL,
+					statusCode:  resp.StatusCode,
+					header:      resp.Header,
+					body:        respBody,
+					replaced:    didReplace,
+				}
 				cacheResult(cacheKey, &res)
 				results <- res
 			} else {
-				res := linkRaceResult{err: fmt.Errorf("%s (%s)", failReason, u.URL), upstreamURL: u.URL, statusCode: resp.StatusCode, header: resp.Header, body: respBody}
+				res := linkRaceResult{
+					err:         fmt.Errorf("%s (%s)", failReason, u.URL),
+					upstreamURL: u.URL,
+					statusCode:  resp.StatusCode,
+					header:      resp.Header,
+					body:        respBody,
+					replaced:    didReplace}
 				cacheResult(cacheKey, &res)
 				results <- res
 			}
@@ -534,7 +539,7 @@ func (h *Handler) tryLinkResolverRace(w http.ResponseWriter, r *http.Request, up
 	for res := range results {
 		if res.err == nil {
 			log.Printf("[RACE-WIN] Service: %s | Status: %d | Time: %v | Winner: %s", service, res.statusCode, time.Since(startTime), res.upstreamURL)
-			writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL)
+			writeLinkResolverResponse(w, res.header, res.statusCode, res.body, res.upstreamURL, startTime, originalDecodedURL, res.replaced)
 			return true, "", nil
 		}
 		lastErr = res.err
@@ -573,48 +578,26 @@ func excludeUpstreams(upstreams []*config.Upstream, exclude []*config.Upstream) 
 	return filtered
 }
 
-func writeLinkResolverResponse(w http.ResponseWriter, header http.Header, statusCode int, body []byte, upstreamURL string, startTime time.Time, originalURL string) {
-	elapsedDuration := time.Since(startTime)
-	elapsedMs := float64(elapsedDuration.Microseconds()) / 1000.0
-	elapsedSec := elapsedDuration.Seconds()
+func writeLinkResolverResponse(w http.ResponseWriter, header http.Header, statusCode int, body []byte, upstreamURL string, startTime time.Time, originalURL string, restoreOriginal bool) {
+	elapsedMs, elapsedSec := elapsedTiming(startTime)
 
-	for k, vv := range header {
-		lowerK := strings.ToLower(k)
-		if utils.HopByHopHeaders[lowerK] || lowerK == "content-length" || lowerK == "transfer-encoding" || lowerK == "content-encoding" {
-			continue
-		}
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-
+	copyResponseHeaders(w, header, "content-encoding")
 	w.Header().Set("X-Proxy-Instance", upstreamURL)
 	w.Header().Set("X-Proxy-Time", fmt.Sprintf("%.2fms", elapsedMs))
 
-	var jsonMap map[string]any
-	if jsonErr := json.Unmarshal(body, &jsonMap); jsonErr == nil {
-		if originalURL != "" {
-			if _, hasLink := jsonMap["link"]; hasLink {
-				jsonMap["link"] = originalURL
+	restoreLink := func(m map[string]any) {
+		if restoreOriginal && originalURL != "" {
+			if _, hasLink := m["link"]; hasLink {
+				m["link"] = originalURL
 			}
 		}
+	}
 
-		jsonMap["proxy_instance"] = upstreamURL
-		jsonMap["proxy_elapsed"] = map[string]any{
-			"ms": elapsedMs,
-			"s":  elapsedSec,
-		}
-
-		buf := &bytes.Buffer{}
-		encoder := json.NewEncoder(buf)
-		encoder.SetEscapeHTML(false)
-
-		if marshalErr := encoder.Encode(jsonMap); marshalErr == nil {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(statusCode)
-			w.Write(buf.Bytes())
-			return
-		}
+	if modifiedJSON, ok := augmentJSONBody(body, upstreamURL, elapsedMs, elapsedSec, restoreLink); ok {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(statusCode)
+		w.Write(modifiedJSON)
+		return
 	}
 
 	w.WriteHeader(statusCode)
