@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/Marlliton/slogpretty v0.1.3
 	github.com/barasher/go-exiftool v1.10.0
-	github.com/go-chi/chi/v5 v5.3.0
+	github.com/go-chi/chi/v5 v5.4.0
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/uptrace/bun v1.2.18
