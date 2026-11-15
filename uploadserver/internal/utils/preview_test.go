@@ -131,6 +131,29 @@ func probeWebp(t *testing.T, path string) (int, int, int) {
 	return w, h, frames
 }
 
+func webpFrameDelay(t *testing.T, path string) float64 {
+	t.Helper()
+	out, err := exec.Command("ffmpeg", "-hide_banner", "-i", path, "-vf", "showinfo",
+		"-f", "null", "-").CombinedOutput()
+	if err != nil {
+		t.Fatalf("decoding %s: %v (%s)", path, err, out)
+	}
+	var times []float64
+	for _, part := range strings.Split(string(out), "pts_time:") {
+		fields := strings.Fields(part)
+		if len(fields) == 0 {
+			continue
+		}
+		if v, perr := strconv.ParseFloat(fields[0], 64); perr == nil {
+			times = append(times, v)
+		}
+	}
+	if len(times) < 2 {
+		t.Fatalf("could not read frame timings from %s", path)
+	}
+	return times[1] - times[0]
+}
+
 func TestOptimizeWebpHDFitsChatterinoBudget(t *testing.T) {
 	setupDirs(t)
 	webpDir := filepath.Join(config.ThumbDir, "w")
@@ -153,6 +176,37 @@ func TestOptimizeWebpHDFitsChatterinoBudget(t *testing.T) {
 	}
 	if w*h*frames*4 > chatterinoMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
+	}
+	if delay := webpFrameDelay(t, out); delay != 0.05 {
+		t.Fatalf("frame delay %v, want 0.05 (20fps playback)", delay)
+	}
+}
+
+func TestOptimizeWebpShortVideoStaysRealTime(t *testing.T) {
+	setupDirs(t)
+	webpDir := filepath.Join(config.ThumbDir, "w")
+	if err := os.MkdirAll(webpDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "1920x1080", 1.0)
+
+	out, err := optimizeWebp(source, webpDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeWebp: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 480 || h != 270 {
+		t.Fatalf("preview dims %dx%d, want 480x270", w, h)
+	}
+	if frames != 20 {
+		t.Fatalf("preview frames %d, want 20 (1s at 20fps)", frames)
+	}
+	if w*h*frames*4 > chatterinoMaxDecodedBytes {
+		t.Fatalf("preview exceeds chatterino budget")
+	}
+	if delay := webpFrameDelay(t, out); delay != 0.05 {
+		t.Fatalf("frame delay %v, want 0.05 (real-time loop)", delay)
 	}
 }
 

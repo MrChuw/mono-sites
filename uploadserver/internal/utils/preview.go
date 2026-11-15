@@ -53,6 +53,7 @@ const (
 	previewShortEdgeCap       = 270
 	previewMinFrames          = 8
 	previewMaxFrames          = 40
+	previewPlaybackFps        = 20
 	previewBudgetMargin       = 0.99
 )
 
@@ -496,6 +497,19 @@ func videoDimensions(path string) (int, int, error) {
 	return w, h, nil
 }
 
+func videoDuration(path string) (float64, error) {
+	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+		"-of", "csv=p=0", path).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	d, perr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if perr != nil || d <= 0 {
+		return 0, fmt.Errorf("unexpected ffprobe duration output: %q", string(out))
+	}
+	return d, nil
+}
+
 func evenDim(v float64) int {
 	d := int(v) / 2 * 2
 	if d < 2 {
@@ -563,8 +577,20 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 
 	scale := 1.0
 	frames := previewMaxFrames
+	sampleFps := float64(previewPlaybackFps)
 	if srcW, srcH, perr := videoDimensions(sourcePath); perr == nil {
 		scale, frames = previewPlan(srcW, srcH)
+		if dur, derr := videoDuration(sourcePath); derr == nil {
+			if realTime := int(dur * float64(previewPlaybackFps)); frames > realTime {
+				frames = realTime
+			}
+			if frames < 1 {
+				frames = 1
+			}
+			sampleFps = float64(frames) / dur
+		} else {
+			slog.Warn("Could not probe video duration for preview plan", "error", derr)
+		}
 	} else {
 		slog.Warn("Could not probe video dimensions for preview plan", "error", perr)
 	}
@@ -575,7 +601,7 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 	minQ := 10
 
 	for scale >= minScale {
-		maxPath, maxSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, initQuality, frames)
+		maxPath, maxSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, initQuality, frames, sampleFps)
 		if err != nil {
 			return "", err
 		}
@@ -600,7 +626,7 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 			return renameToFinal(maxPath, finalWebpPath)
 		}
 
-		minPath, minSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, minQ, frames)
+		minPath, minSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, minQ, frames, sampleFps)
 		if err != nil {
 			return "", err
 		}
@@ -628,7 +654,7 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 
 		for low <= high {
 			midQuality := (low + high) / 2
-			midPath, midSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, midQuality, frames)
+			midPath, midSize, err := runFFmpegWebp(sourcePath, webpDir, baseName, scale, midQuality, frames, sampleFps)
 			if err != nil {
 				break
 			}
@@ -672,13 +698,13 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 	return "", fmt.Errorf("unable to bring video webp preview under size limit with given constraints")
 }
 
-func runFFmpegWebp(sourcePath, webpDir, baseName string, scale float64, quality, frames int) (string, int64, error) {
+func runFFmpegWebp(sourcePath, webpDir, baseName string, scale float64, quality, frames int, sampleFps float64) (string, int64, error) {
 	tempPath := filepath.Join(webpDir, fmt.Sprintf("%s_q%d_s%d_f%d.webp", baseName, quality, int(scale*100), frames))
 	scaleExpr := fmt.Sprintf("trunc(iw*%f/2)*2", scale)
 
 	cmd := exec.Command("ffmpeg", "-y",
 		"-i", sourcePath,
-		"-vf", fmt.Sprintf("fps=10,scale=%s:-2:flags=lanczos", scaleExpr),
+		"-vf", fmt.Sprintf("fps=%f,scale=%s:-2:flags=lanczos,settb=1/90000,setpts=N/(%d*TB),fps=%d", sampleFps, scaleExpr, previewPlaybackFps, previewPlaybackFps),
 		"-frames:v", strconv.Itoa(frames),
 		"-c:v", "libwebp",
 		"-compression_level", "5",
