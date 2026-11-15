@@ -3,6 +3,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,11 +11,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/uptrace/bun"
 
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
+	"uploadserver/internal/stats"
 )
 
 type PreviewJob struct {
@@ -46,8 +49,18 @@ var (
 func EnqueuePreviewJob(fileID string) {
 	select {
 	case PreviewQueue <- PreviewJob{FileID: fileID}:
+		stats.SetPreviewQueueDepth(int64(len(PreviewQueue)))
 	default:
 		slog.Warn("Preview queue full, dropping job", "file_id", fileID)
+	}
+}
+
+func recordPreviewAsset(path, class string) {
+	if path == "" {
+		return
+	}
+	if fi, err := os.Stat(path); err == nil {
+		stats.RecordPreviewGen(class, fi.Size())
 	}
 }
 
@@ -73,11 +86,15 @@ func ProcessPreviewJob(ctx context.Context, client *bun.DB, job PreviewJob) erro
 	defer f.Close()
 
 	buffer := make([]byte, 512)
-	if _, err := f.Read(buffer); err != nil {
-		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", err.Error(), nil)
-		return err
+	n, readErr := f.Read(buffer)
+	if readErr != nil && readErr != io.EOF {
+		_ = db.UpdateFilePreview(ctx, client, file.ID, "error", readErr.Error(), nil)
+		return readErr
 	}
-	mimeType := http.DetectContentType(buffer)
+	var mimeType string
+	if n > 0 {
+		mimeType = http.DetectContentType(buffer[:n])
+	}
 
 	if mimeType == "application/octet-stream" {
 		ext := strings.ToLower(filepath.Ext(file.SavedPath))
@@ -93,13 +110,25 @@ func ProcessPreviewJob(ctx context.Context, client *bun.DB, job PreviewJob) erro
 		}
 	}
 
-	if strings.HasPrefix(mimeType, "image/") {
-		return processImagePreview(ctx, client, file)
-	} else if strings.HasPrefix(mimeType, "video/") {
-		return processVideoPreview(ctx, client, file)
-	} else {
-		return db.UpdateFilePreview(ctx, client, file.ID, "skipped", "", nil)
+	var previewErr error
+	start := time.Now()
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		previewErr = processImagePreview(ctx, client, file)
+	case strings.HasPrefix(mimeType, "video/"):
+		previewErr = processVideoPreview(ctx, client, file)
+	default:
+		stats.NotePreviewDuration(time.Since(start).Milliseconds())
+		return processBytePlotPreview(ctx, client, file)
 	}
+	stats.NotePreviewDuration(time.Since(start).Milliseconds())
+
+	if previewErr == nil {
+		return nil
+	}
+	stats.RecordPreviewFail(stats.ClassifyMIME(mimeType))
+	slog.Warn("Native preview failed, falling back to byte plot", "file_id", file.ID, "error", previewErr)
+	return processBytePlotPreview(ctx, client, file)
 }
 
 func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedFile) error {
@@ -138,6 +167,21 @@ func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 		defer os.Remove(tmpJpgPath)
 	}
 
+	var webpPath string
+	switch strings.ToLower(filepath.Ext(file.SavedPath)) {
+	case ".gif", ".webp":
+		webpDir := filepath.Join(config.ThumbDir, "w")
+		if mkErr := os.MkdirAll(webpDir, 0755); mkErr != nil {
+			slog.Error("Failed to create webp preview dir", "file_id", file.ID, "error", mkErr)
+			break
+		}
+		wp, wpErr := optimizeWebp(file.SavedPath, webpDir, baseName)
+		if wpErr != nil {
+			slog.Error("WebP preview generation failed for animated image", "file_id", file.ID, "error", wpErr)
+		}
+		webpPath = wp
+	}
+
 	fileInfo, err := os.Stat(sourcePath)
 	if err != nil {
 		errMsg := fmt.Sprintf("failed to stat original file: %v", err)
@@ -169,8 +213,13 @@ func processImagePreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 			return err
 		}
 	}
+
+	recordPreviewAsset(finalThumbPath, stats.ClassJPG)
+	recordPreviewAsset(webpPath, stats.ClassWEBP)
+
 	fields := &db.PreviewFields{
 		ThumbnailPath: finalThumbPath,
+		WebpPath:      webpPath,
 	}
 
 	return db.UpdateFilePreview(ctx, client, file.ID, "done", "", fields)
@@ -345,6 +394,18 @@ func processVideoPreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 	gifDir := filepath.Join(config.ThumbDir, "p")
 	webpDir := filepath.Join(config.ThumbDir, "w")
 
+	for _, dir := range []string{thumbDir, gifDir, webpDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+
+	webpPath, err := optimizeWebp(file.SavedPath, webpDir, baseName)
+	if err != nil {
+		slog.Error("WebP generation and optimization failed", "file_id", file.ID, "error", err)
+		webpPath = ""
+	}
+
 	tempFramePath := filepath.Join(thumbDir, baseName+"_temp_frame.jpg")
 
 	cmdThumb := exec.Command("ffmpeg", "-y", "-ss", "00:00:05", "-i", file.SavedPath, "-q:v", "2", "-vframes", "1", tempFramePath)
@@ -389,11 +450,13 @@ func processVideoPreview(ctx context.Context, client *bun.DB, file *db.UploadedF
 		gifPath = ""
 	}
 
-	webpPath, err := optimizeWebp(file.SavedPath, webpDir, baseName)
-	if err != nil {
-		slog.Error("WebP generation and optimization failed", "file_id", file.ID, "error", err)
-		webpPath = ""
+	if thumbPath == "" && gifPath == "" && webpPath == "" {
+		return fmt.Errorf("no video preview could be generated")
 	}
+
+	recordPreviewAsset(thumbPath, stats.ClassJPG)
+	recordPreviewAsset(webpPath, stats.ClassWEBP)
+	recordPreviewAsset(gifPath, stats.ClassGIF)
 
 	fields := &db.PreviewFields{
 		ThumbnailPath: thumbPath,

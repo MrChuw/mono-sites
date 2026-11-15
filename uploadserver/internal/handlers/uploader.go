@@ -17,6 +17,7 @@ import (
 
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
+	"uploadserver/internal/stats"
 	"uploadserver/internal/umami"
 	"uploadserver/internal/utils"
 )
@@ -141,6 +142,7 @@ func UploadFileHandler(client *bun.DB, cleanMetadata bool) http.HandlerFunc {
 		var fileSize int64
 		var fileHash string
 		var contentType string
+		var receivedBytes int64
 
 		if cleanMetadata {
 			slog.Debug("processing file with metadata stripping")
@@ -155,9 +157,11 @@ func UploadFileHandler(client *bun.DB, cleanMetadata bool) http.HandlerFunc {
 				return
 			}
 			tmpFile.Close()
+			receivedBytes = written
 
 			if written > maxSize {
 				slog.Error("upload blocked: cleaned file size exceeds limit", "size", written, "max_size", maxSize)
+				stats.RecordUploadReject(stats.ClassOther)
 				http.Error(w, "File size exceeds limit", http.StatusRequestEntityTooLarge)
 				return
 			}
@@ -227,9 +231,11 @@ func UploadFileHandler(client *bun.DB, cleanMetadata bool) http.HandlerFunc {
 				return
 			}
 			tmpFile.Close()
+			receivedBytes = written
 
 			if written > maxSize {
 				slog.Error("upload blocked: raw file size exceeds limit", "size", written, "max_size", maxSize)
+				stats.RecordUploadReject(stats.ClassOther)
 				http.Error(w, "File size exceeds limit", http.StatusRequestEntityTooLarge)
 				return
 			}
@@ -298,6 +304,9 @@ func UploadFileHandler(client *bun.DB, cleanMetadata bool) http.HandlerFunc {
 
 		slog.Debug("saving file metadata record to database")
 		if err := db.SaveFileWithTags(ctx, client, &newFile, tagNames); err != nil {
+			if strings.Contains(strings.ToUpper(err.Error()), "SQLITE_BUSY") {
+				stats.RecordBusy()
+			}
 			_ = os.Remove(finalPath)
 			slog.Error("failed to save database records, rolling back physical file", "error", err)
 			http.Error(w, "Database error", http.StatusInternalServerError)
@@ -305,13 +314,24 @@ func UploadFileHandler(client *bun.DB, cleanMetadata bool) http.HandlerFunc {
 		}
 		slog.Debug("file record saved successfully", "database_id", newFile.ID)
 
+		if deduplicated == "true" {
+			stats.RecordDedup(fileSize)
+			stats.RecordUpload(apiKey.ID, stats.ClassifyMIME(contentType), receivedBytes, 0)
+		} else {
+			stats.RecordUpload(apiKey.ID, stats.ClassifyMIME(contentType), receivedBytes, fileSize)
+		}
+
 		baseURL := buildBaseURL(r)
 		relPath, _ := filepath.Rel(config.UploadDir, finalPath)
 		url := fmt.Sprintf("%s/%s", baseURL, relPath)
 		deletionURL := fmt.Sprintf("%s/api/delete/%s", baseURL, newFile.DeletionToken)
 		baseName := strings.TrimSuffix(filepath.Base(finalPath), filepath.Ext(finalPath))
 
-		thumbURL := fmt.Sprintf("%s/preview/t/%s.jpg", baseURL, baseName)
+		thumbExt := ".png"
+		if strings.HasPrefix(contentType, "image/") || strings.HasPrefix(contentType, "video/") {
+			thumbExt = ".jpg"
+		}
+		thumbURL := fmt.Sprintf("%s/preview/t/%s%s", baseURL, baseName, thumbExt)
 		response := map[string]any{
 			"status":        "success",
 			"url":           url,

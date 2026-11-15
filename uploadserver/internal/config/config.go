@@ -9,23 +9,24 @@ import (
 )
 
 var (
-	BaseDir              string
-	DatabaseURL          string
-	UploadDir            string
-	TrashDir             string
-	ThumbDir             string
-	ForwardedProto       string
-	MaxNameLength        int
-	DefaultMaxUploadSize int64
-	InitialTokenLength   int
-	ReservedNames        map[string]bool
-	UmamiURLBase         string
-	UmamiWebsiteID       string
-	UmamiHostname        string
-	Port                 string
-	Proxy                string
-	Cdn                  string
-	Environment          string
+	BaseDir                string
+	DatabaseURL            string
+	UploadDir              string
+	TrashDir               string
+	ThumbDir               string
+	ForwardedProto         string
+	MaxNameLength          int
+	DefaultMaxUploadSize   int64
+	InitialTokenLength     int
+	ReservedNames          map[string]bool
+	UmamiURLBase           string
+	UmamiWebsiteID         string
+	UmamiHostname          string
+	Port                   string
+	Proxy                  string
+	Cdn                    string
+	Environment            string
+	StatusRawRetentionDays int
 )
 
 func LoadConfig() {
@@ -46,6 +47,7 @@ func LoadConfig() {
 	Proxy = getEnv("PROXY", "i")
 	Cdn = getEnv("CDN", "im")
 	Environment = getEnv("ENVIRONMENT", "verbose")
+	StatusRawRetentionDays = getEnvInt("STATUS_RAW_RETENTION_DAYS", 0)
 
 	reserved := getEnv("RESERVED_NAMES", "api,static,assets")
 	ReservedNames = make(map[string]bool)

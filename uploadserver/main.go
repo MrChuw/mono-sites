@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/barasher/go-exiftool"
 	"github.com/go-chi/chi/v5"
@@ -24,6 +25,7 @@ import (
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
 	"uploadserver/internal/handlers"
+	"uploadserver/internal/stats"
 	"uploadserver/internal/umami"
 	"uploadserver/internal/utils"
 )
@@ -105,6 +107,8 @@ func startServer() {
 		))
 	}
 
+	stats.Start(ctx, dbConn)
+
 	if err := utils.PurgeTrashOnStartup(ctx, dbConn); err != nil {
 		slog.Error("Startup purge error", "error", err)
 	}
@@ -125,9 +129,11 @@ func startServer() {
 	r.Use(middleware.Recoverer)
 	r.Use(handlers.CloudflareMiddleware)
 
-	r.Get("/", handlers.RootHandler)
+	r.Get("/", handlers.RootHandler(dbConn))
 	r.Get("/favicon.ico", handlers.FaviconHandler(dbConn))
 	r.Get("/api/delete/{token}", handlers.DeleteFileHandler(dbConn))
+	r.Get("/status", handlers.StatusHandler(dbConn))
+	r.Post("/status", handlers.StatusHandler(dbConn))
 	r.Get("/{file_path:.*}", handlers.ServeFileHandler(dbConn))
 	// r.HandleFunc("/*", handlers.serveFileHandler(dbConn))
 
@@ -167,6 +173,10 @@ func initDB() (*bun.DB, error) {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, err
 		}
+	}
+
+	if !strings.Contains(dbPath, "?") {
+		dbPath += "?_pragma=busy_timeout(5000)"
 	}
 
 	sqldb, err := sql.Open("sqlite", dbPath)

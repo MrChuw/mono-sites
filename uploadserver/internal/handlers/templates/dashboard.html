@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30; url=/status">
+<title>uploadserver status — dashboard</title>
+<style>
+  body {
+    background: #111;
+    color: #ccc;
+    font-family: monospace;
+    font-size: 14px;
+    line-height: 1.5;
+    margin: 2em;
+  }
+  h1 {
+    font-size: 1em;
+    font-weight: normal;
+    color: #888;
+    margin: 0 0 1em;
+  }
+  h2 {
+    font-size: 1em;
+    font-weight: normal;
+    color: #aaa;
+    margin: 2em 0 0.5em;
+  }
+  table {
+    border-collapse: collapse;
+  }
+  td {
+    padding: 1px 2em 1px 0;
+    vertical-align: top;
+  }
+  td:first-child {
+    color: #777;
+  }
+  a {
+    color: #7aa;
+  }
+  tr.head td {
+    color: #555;
+    border-bottom: 1px solid #333;
+  }
+  p {
+    color: #666;
+    font-size: 12px;
+    margin: 0.5em 0 0;
+    max-width: 40em;
+  }
+  .note {
+    margin-top: 2.5em;
+  }
+  .chart {
+    display: flex;
+    gap: 2px;
+    align-items: flex-end;
+    height: 100px;
+    border-bottom: 1px solid #333;
+    width: fit-content;
+  }
+  .col {
+    width: 10px;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+  }
+  .bar {
+    width: 100%;
+    background: #4a9;
+  }
+  .bar.rx {
+    background: #a74;
+  }
+  .bar.files {
+    background: #57a;
+  }
+</style>
+</head>
+<body>
+<h1>uploadserver status — dashboard</h1>
+
+<h2>live</h2>
+<table>
+  <tr><td>uptime</td><td>{{.Uptime}}</td></tr>
+  <tr><td>serving since</td><td>{{.ServingSince}}</td></tr>
+  <tr><td>storage used</td><td>{{size .StorageUsed}}</td></tr>
+  <tr><td>preview queue</td><td>{{num .QueueDepth}} jobs</td></tr>
+  <tr><td>preview duration</td><td>{{ms .PreviewEMA}} (avg)</td></tr>
+</table>
+
+<h2>all-time</h2>
+<table>
+  <tr><td>transferred</td><td>{{size .Transferred}}</td></tr>
+  <tr><td>received (pre-clean)</td><td>{{size .Received}}</td></tr>
+  <tr><td>stored (post-clean)</td><td>{{size .Stored}}</td></tr>
+  <tr><td>files uploaded</td><td>{{num .FilesUploaded}}</td></tr>
+  <tr><td>files deleted</td><td>{{num .FilesDeleted}}</td></tr>
+  <tr><td>bytes freed (trash purges)</td><td>{{size .BytesFreed}}</td></tr>
+  <tr><td>dedup hits</td><td>{{num .DedupHits}}</td></tr>
+  <tr><td>dedup saved</td><td>{{size .DedupSaved}}</td></tr>
+  <tr><td>resolver page views</td><td>{{num .ResolverHits}}</td></tr>
+  <tr><td>auth failures</td><td>{{num .AuthFailures}}</td></tr>
+  <tr><td>db busy errors</td><td>{{num .BusyErrors}}</td></tr>
+  <tr><td>preview failures</td><td>{{num .PreviewFailures}}</td></tr>
+</table>
+
+<h2>served — last 30 days</h2>
+<div class="chart">
+  {{range .Days}}<div class="col" title="{{.Label}}: {{size .TX}} served"><div class="bar" style="height: {{.TXPct}}%"></div></div>{{end}}
+</div>
+<p>bytes delivered by this process (files + previews)</p>
+
+<h2>received — last 30 days</h2>
+<div class="chart">
+  {{range .Days}}<div class="col" title="{{.Label}}: {{size .RX}} received"><div class="bar rx" style="height: {{.RXPct}}%"></div></div>{{end}}
+</div>
+<p>upload ingress bytes, before metadata cleaning</p>
+
+<h2>uploads — last 30 days</h2>
+<div class="chart">
+  {{range .Days}}<div class="col" title="{{.Label}}: {{num .Files}} uploads"><div class="bar files" style="height: {{.FilesPct}}%"></div></div>{{end}}
+</div>
+<p>successful uploads, dedup hits included</p>
+
+<h2>events — last 30 days</h2>
+<table>
+  <tr class="head"><td>kind</td><td>requests</td><td>bytes in</td><td>bytes out</td><td>files</td></tr>
+  {{range .Kinds}}<tr><td>{{.Name}}</td><td>{{num .Requests}}</td><td>{{size .BytesIn}}</td><td>{{size .BytesOut}}</td><td>{{num .Files}}</td></tr>{{end}}
+</table>
+
+{{if .FileClasses}}
+<h2>served by content class — last 30 days</h2>
+<table>
+  <tr class="head"><td>class</td><td>requests</td><td>bytes out</td></tr>
+  {{range .FileClasses}}<tr><td>{{.Name}}</td><td>{{num .Requests}}</td><td>{{size .BytesOut}}</td></tr>{{end}}
+</table>
+{{end}}
+
+{{if .UploadClasses}}
+<h2>uploads by content class — last 30 days</h2>
+<table>
+  <tr class="head"><td>class</td><td>files</td><td>received</td><td>stored</td></tr>
+  {{range .UploadClasses}}<tr><td>{{.Name}}</td><td>{{num .Files}}</td><td>{{size .BytesIn}}</td><td>{{size .BytesOut}}</td></tr>{{end}}
+</table>
+{{end}}
+
+{{if .PreviewClasses}}
+<h2>previews served by type — last 30 days</h2>
+<table>
+  <tr class="head"><td>type</td><td>requests</td><td>bytes out</td></tr>
+  {{range .PreviewClasses}}<tr><td>{{.Name}}</td><td>{{num .Requests}}</td><td>{{size .BytesOut}}</td></tr>{{end}}
+</table>
+{{end}}
+
+{{if .Keys}}
+<h2>uploads by key owner — last 30 days</h2>
+<table>
+  <tr class="head"><td>owner</td><td>uploads</td><td>received</td><td>stored</td></tr>
+  {{range .Keys}}<tr><td>{{.Owner}}</td><td>{{num .Uploads}}</td><td>{{size .Received}}</td><td>{{size .Stored}}</td></tr>{{end}}
+</table>
+{{end}}
+
+{{if .TopFiles}}
+<h2>top served files</h2>
+<table>
+  <tr class="head"><td>file</td><td>requests</td><td>bytes out</td><td>last served</td></tr>
+  {{range .TopFiles}}<tr><td>{{.Name}}</td><td>{{num .Requests}}</td><td>{{size .BytesOut}}</td><td>{{.LastServed}}</td></tr>{{end}}
+</table>
+{{end}}
+
+<p class="note">
+All-time counters start when this stats system was deployed (transferred keeps its previous history). Time buckets are UTC. Raw event detail retention is configured with STATUS_RAW_RETENTION_DAYS; rollups are kept forever. This page refreshes itself every 30 seconds.
+</p>
+<p><a href="/status?format=json">json export</a> — same data with raw byte counts (uses this session's cookie, or the X-API-Key header for machine reads).</p>
+</body>
+</html>

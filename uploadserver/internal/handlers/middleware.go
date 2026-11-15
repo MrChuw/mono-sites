@@ -10,6 +10,7 @@ import (
 	"github.com/uptrace/bun"
 
 	"uploadserver/internal/db"
+	"uploadserver/internal/stats"
 )
 
 type CloudflareMetadata struct {
@@ -52,6 +53,7 @@ func AuthMiddleware(client *bun.DB) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiKey := r.Header.Get("X-API-Key")
 			if apiKey == "" {
+				stats.RecordAuthFailure()
 				http.Error(w, "Missing X-API-Key header", http.StatusUnauthorized)
 				return
 			}
@@ -59,6 +61,7 @@ func AuthMiddleware(client *bun.DB) func(http.Handler) http.Handler {
 			keyRecord, err := db.GetAPIKeyByKey(r.Context(), client, apiKey)
 			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
+					stats.RecordAuthFailure()
 					http.Error(w, "Invalid or revoked API Key", http.StatusForbidden)
 				} else {
 					http.Error(w, "Database error", http.StatusInternalServerError)

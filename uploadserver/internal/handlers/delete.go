@@ -9,6 +9,7 @@ import (
 	"github.com/uptrace/bun"
 
 	"uploadserver/internal/db"
+	"uploadserver/internal/stats"
 	"uploadserver/internal/umami"
 	"uploadserver/internal/utils"
 )
@@ -45,6 +46,7 @@ func DeleteFileHandler(client *bun.DB) http.HandlerFunc {
 			http.Error(w, "Deletion failed", http.StatusInternalServerError)
 			return
 		}
+		stats.RecordFileDeleted(stats.ClassManual)
 
 		respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
 	}

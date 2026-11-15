@@ -8,11 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/uptrace/bun"
 
 	"uploadserver/internal/config"
+	"uploadserver/internal/stats"
 	"uploadserver/internal/umami"
 )
 
@@ -24,6 +27,7 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 		parts := strings.Split(filePath, "/")
 		for _, part := range parts {
 			if part == ".trash" || strings.HasPrefix(part, ".") {
+				stats.RecordForbidden()
 				http.Error(w, "Access denied", http.StatusForbidden)
 				return
 			}
@@ -46,12 +50,14 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 
 		rel, err := filepath.Rel(absUpload, absFile)
 		if err != nil || strings.HasPrefix(rel, "..") {
+			stats.RecordForbidden()
 			http.Error(w, "Access denied", http.StatusForbidden)
 			return
 		}
 
 		info, err := os.Stat(absFile)
 		if err != nil || info.IsDir() {
+			stats.RecordNotFound()
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
@@ -85,6 +91,7 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 				}
 				targetURL := config.ForwardedProto + "://" + targetHost + r.URL.RequestURI()
 				w.Header().Set("Location", targetURL)
+				stats.RecordRedirect()
 				http.Redirect(w, r, targetURL, http.StatusFound)
 				return
 			}
@@ -100,14 +107,79 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 
+		served := estimateServedBytes(r, info.Size())
+
 		if r.Header.Get("X-Handled-By") == "Caddy" {
 			w.Header().Set("X-Accel-Redirect", "/internal-media/"+filePath)
+			recordDelivery(r, isPreview, fullPath, mime, served)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
+		recordDelivery(r, isPreview, fullPath, mime, served)
 		http.ServeFile(w, r, absFile)
 	}
+}
+
+func recordDelivery(r *http.Request, isPreview bool, fullPath, mimeType string, served int64) {
+	if isPreview {
+		stats.RecordPreviewGet(stats.ClassifyPreviewExt(filepath.Ext(fullPath)), served)
+		return
+	}
+	stats.RecordFileGet(stats.ClassifyMIME(mimeType), served)
+	baseName := strings.TrimSuffix(filepath.Base(fullPath), filepath.Ext(fullPath))
+	stats.RecordFileServed(baseName, served)
+}
+
+func estimateServedBytes(r *http.Request, size int64) int64 {
+	if r.Method == http.MethodHead {
+		return 0
+	}
+	spec := r.Header.Get("Range")
+	if spec == "" {
+		return size
+	}
+	spec = strings.TrimPrefix(spec, "bytes=")
+	if strings.Contains(spec, ",") {
+		return 0
+	}
+	dash := strings.Index(spec, "-")
+	if dash < 0 {
+		return size
+	}
+	startStr := strings.TrimSpace(spec[:dash])
+	if startStr == "" {
+		n, err := strconv.ParseInt(strings.TrimSpace(spec[dash+1:]), 10, 64)
+		if err != nil {
+			return size
+		}
+		if n > size {
+			n = size
+		}
+		return n
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil {
+		return size
+	}
+	if start >= size {
+		return 0
+	}
+	endStr := strings.TrimSpace(spec[dash+1:])
+	if endStr == "" {
+		return size - start
+	}
+	end, err := strconv.ParseInt(endStr, 10, 64)
+	if err != nil {
+		return size - start
+	}
+	if end >= size {
+		end = size - 1
+	}
+	if end < start {
+		return 0
+	}
+	return end - start + 1
 }
 
 var linkResolvers = []*regexp.Regexp{
@@ -153,10 +225,27 @@ func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, inf
 	webpURL := fmt.Sprintf("%s://%s/preview/w/%s.webp?chatterino", scheme, r.Host, baseName)
 	webpPath := filepath.Join(config.ThumbDir, "w", baseName+".webp")
 
+	isAnimatedSource := strings.HasPrefix(mimeType, "video/") ||
+		mimeType == "image/gif" || mimeType == "image/webp"
+	if isAnimatedSource {
+		if _, err := os.Stat(webpPath); err != nil {
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				time.Sleep(250 * time.Millisecond)
+				if _, err := os.Stat(webpPath); err == nil {
+					break
+				}
+			}
+		}
+	}
+
 	if _, err := os.Stat(webpPath); err != nil {
 		jpgPath := filepath.Join(config.ThumbDir, "t", baseName+".jpg")
+		pngPath := filepath.Join(config.ThumbDir, "t", baseName+".png")
 		if _, err := os.Stat(jpgPath); err == nil {
 			webpURL = fmt.Sprintf("%s://%s/preview/t/%s.jpg?chatterino", scheme, r.Host, baseName)
+		} else if _, err := os.Stat(pngPath); err == nil {
+			webpURL = fmt.Sprintf("%s://%s/preview/t/%s.png?chatterino", scheme, r.Host, baseName)
 		} else {
 			webpURL = ""
 		}
@@ -196,6 +285,7 @@ func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, inf
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Expires", "0")
 	w.Header().Set("Vary", "*")
+	stats.RecordResolverOG(int64(len(htmlContent)))
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(htmlContent))
 }

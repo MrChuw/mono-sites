@@ -21,6 +21,7 @@ import (
 
 	"uploadserver/internal/config"
 	"uploadserver/internal/db"
+	"uploadserver/internal/stats"
 )
 
 func SecureRandomString(length int) string {
@@ -129,6 +130,9 @@ func PurgeTrashOnStartup(ctx context.Context, client *bun.DB) error {
 		if err := db.MarkDeletedLogAsProcessed(ctx, client, logItem.ID); err != nil {
 			return err
 		}
+		if logItem.TrashPath != "" {
+			stats.RecordTrashPurge(logItem.FileSize)
+		}
 	}
 	return nil
 }
@@ -162,6 +166,8 @@ func runPurge(ctx context.Context, client *bun.DB) {
 	for _, f := range expired {
 		if err := ExecuteFileDeletion(ctx, client, &f); err != nil {
 			slog.Error("Error deleting expired file", "file_id", f.ID, "error", err)
+		} else {
+			stats.RecordFileDeleted(stats.ClassTTL)
 		}
 	}
 
@@ -182,6 +188,8 @@ func runPurge(ctx context.Context, client *bun.DB) {
 
 		if err := db.MarkDeletedLogAsProcessed(ctx, client, entry.ID); err != nil {
 			slog.Error("Error updating log status", "log_id", entry.ID, "error", err)
+		} else if entry.TrashPath != "" {
+			stats.RecordTrashPurge(entry.FileSize)
 		}
 	}
 }
