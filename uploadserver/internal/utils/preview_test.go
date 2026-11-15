@@ -234,3 +234,30 @@ func TestOptimizeWebpSmallSourceStaysNative(t *testing.T) {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
 }
+
+func TestOptimizeWebp1440pPlanScaleBelowLegacyFloor(t *testing.T) {
+	setupDirs(t)
+	webpDir := filepath.Join(config.ThumbDir, "w")
+	if err := os.MkdirAll(webpDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "2560x1440", 4.5)
+
+	// The 1440p bar scale (270/1440 = 0.1875) sits below the byte-pressure
+	// shrink floor; the loop must still run at the planned scale.
+	out, err := optimizeWebp(source, webpDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeWebp: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 480 || h != 270 {
+		t.Fatalf("preview dims %dx%d, want 480x270", w, h)
+	}
+	if frames != 40 {
+		t.Fatalf("preview frames %d, want 40", frames)
+	}
+	if w*h*frames*4 > chatterinoMaxDecodedBytes {
+		t.Fatalf("preview exceeds chatterino budget")
+	}
+}

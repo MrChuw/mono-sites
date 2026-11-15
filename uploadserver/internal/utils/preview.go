@@ -595,7 +595,10 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 		slog.Warn("Could not probe video dimensions for preview plan", "error", perr)
 	}
 
-	minScale := 0.2
+	// Byte-pressure shrinking is bounded relative to the planned scale: the
+	// plan itself may sit below an absolute floor for high-resolution sources
+	// (e.g. 270/1440 = 0.1875 for 1440p).
+	minScale := scale * 0.2
 
 	initQuality := 80
 	minQ := 10
