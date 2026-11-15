@@ -50,9 +50,9 @@ var (
 
 const (
 	chatterinoMaxDecodedBytes = 20 * 1024 * 1024
-	previewShortEdgeCap       = 540
+	previewShortEdgeCap       = 270
 	previewMinFrames          = 8
-	previewMaxFrames          = 30
+	previewMaxFrames          = 40
 	previewBudgetMargin       = 0.99
 )
 
