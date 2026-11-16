@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,6 +101,55 @@ func TestPreviewPlanRespectsBudget(t *testing.T) {
 	}
 }
 
+func TestPlaybackRate(t *testing.T) {
+	cases := []struct {
+		name    string
+		frames  int
+		dur     float64
+		wantFps int
+	}{
+		{"short clip stays real-time", 90, 4.5, 20},
+		{"tiny clip stays real-time", 20, 1.0, 20},
+		{"budget-length clip stays real-time", 208, 20.885, 20},
+		{"long video slows toward half source speed", 208, 60, 7},
+		{"exactly at the floor boundary", 208, 104, 4},
+		{"very long video floors at min fps", 208, 2640, 4},
+		{"unknown duration falls back to max", 208, 0, 20},
+		{"single frame floors at min fps", 1, 1000, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if fps := playbackRate(tc.frames, tc.dur); fps != tc.wantFps {
+				t.Fatalf("playbackRate(%d, %v) = %d, want %d", tc.frames, tc.dur, fps, tc.wantFps)
+			}
+		})
+	}
+}
+
+func TestComputePlaybackPlan(t *testing.T) {
+	setupDirs(t)
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "640x360", 24)
+
+	scale, frames, sampleFps, playbackFps := computePlaybackPlan(source, previewMaxFrames, previewPlaybackFps)
+	if scale != 113.0/360.0 {
+		t.Fatalf("scale = %v, want %v", scale, 113.0/360.0)
+	}
+	if frames != 208 {
+		t.Fatalf("frames = %d, want 208 (area budget)", frames)
+	}
+	dur, err := videoDuration(source)
+	if err != nil {
+		t.Fatalf("videoDuration: %v", err)
+	}
+	if math.Abs(sampleFps-float64(frames)/dur) > 1e-9 {
+		t.Fatalf("sampleFps = %v, want %v (frames/duration)", sampleFps, float64(frames)/dur)
+	}
+	if playbackFps != 17 {
+		t.Fatalf("playbackFps = %d, want 17 (~2x fast-forward for a 24s source)", playbackFps)
+	}
+}
+
 func generateTestVideo(t *testing.T, path, size string, seconds float64) {
 	t.Helper()
 	gen := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -131,7 +181,7 @@ func probeWebp(t *testing.T, path string) (int, int, int) {
 	return w, h, frames
 }
 
-func webpFrameDelay(t *testing.T, path string) float64 {
+func frameDelay(t *testing.T, path string) float64 {
 	t.Helper()
 	out, err := exec.Command("ffmpeg", "-hide_banner", "-i", path, "-vf", "showinfo",
 		"-f", "null", "-").CombinedOutput()
@@ -177,7 +227,7 @@ func TestOptimizeWebpHDFitsChatterinoBudget(t *testing.T) {
 	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
-	if delay := webpFrameDelay(t, out); delay != 0.05 {
+	if delay := frameDelay(t, out); delay != 0.05 {
 		t.Fatalf("frame delay %v, want 0.05 (20fps playback)", delay)
 	}
 }
@@ -205,7 +255,7 @@ func TestOptimizeWebpShortVideoStaysRealTime(t *testing.T) {
 	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
-	if delay := webpFrameDelay(t, out); delay != 0.05 {
+	if delay := frameDelay(t, out); delay != 0.05 {
 		t.Fatalf("frame delay %v, want 0.05 (real-time loop)", delay)
 	}
 }
@@ -287,7 +337,110 @@ func TestOptimizeWebpLongVideoSpendsBudgetOnFrames(t *testing.T) {
 	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
-	if delay := webpFrameDelay(t, out); delay != 0.05 {
+	if delay := frameDelay(t, out); delay != 0.05 {
 		t.Fatalf("frame delay %v, want 0.05 (20fps playback)", delay)
+	}
+}
+
+func TestOptimizeWebpLongVideoSlowsPlayback(t *testing.T) {
+	setupDirs(t)
+	webpDir := filepath.Join(config.ThumbDir, "w")
+	if err := os.MkdirAll(webpDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "640x360", 60)
+
+	out, err := optimizeWebp(source, webpDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeWebp: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
+	}
+	if frames != 208 {
+		t.Fatalf("preview frames %d, want 208 (whole 60s at the area budget)", frames)
+	}
+	if w*h*frames*4 > previewMaxDecodedBytes {
+		t.Fatalf("preview exceeds chatterino budget")
+	}
+	if delay := frameDelay(t, out); delay < 0.135 || delay > 0.155 {
+		t.Fatalf("frame delay %v, want ~0.143 (7fps, ~2x fast-forward)", delay)
+	}
+}
+
+func TestOptimizeGifShortVideoStaysRealTime(t *testing.T) {
+	setupDirs(t)
+	gifDir := filepath.Join(config.ThumbDir, "p")
+	if err := os.MkdirAll(gifDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "640x360", 8)
+
+	out, err := optimizeGif(source, gifDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeGif: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
+	}
+	if frames != 96 {
+		t.Fatalf("preview frames %d, want 96 (8s at 12fps)", frames)
+	}
+	if delay := frameDelay(t, out); delay < 0.07 || delay > 0.1 {
+		t.Fatalf("frame delay %v, want ~0.083 (real-time 12fps loop)", delay)
+	}
+}
+
+func TestOptimizeGifLongVideoSlowsPlayback(t *testing.T) {
+	setupDirs(t)
+	gifDir := filepath.Join(config.ThumbDir, "p")
+	if err := os.MkdirAll(gifDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "640x360", 30)
+
+	out, err := optimizeGif(source, gifDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeGif: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
+	}
+	if frames != 96 {
+		t.Fatalf("preview frames %d, want 96 (gif frame cap)", frames)
+	}
+	if delay := frameDelay(t, out); delay < 0.15 || delay > 0.18 {
+		t.Fatalf("frame delay %v, want ~0.167 (6fps, ~2x fast-forward)", delay)
+	}
+}
+
+func TestOptimizeGifDwellFloor(t *testing.T) {
+	setupDirs(t)
+	gifDir := filepath.Join(config.ThumbDir, "p")
+	if err := os.MkdirAll(gifDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "640x360", 80)
+
+	out, err := optimizeGif(source, gifDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeGif: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
+	}
+	if frames != 96 {
+		t.Fatalf("preview frames %d, want 96 (gif frame cap)", frames)
+	}
+	if delay := frameDelay(t, out); delay < 0.24 || delay > 0.26 {
+		t.Fatalf("frame delay %v, want 0.25 (min playback fps floor)", delay)
 	}
 }
