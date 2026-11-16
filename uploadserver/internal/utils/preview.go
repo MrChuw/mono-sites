@@ -49,12 +49,15 @@ var (
 )
 
 const (
-	chatterinoMaxDecodedBytes = 20 * 1024 * 1024
-	previewShortEdgeCap       = 270
-	previewMinFrames          = 8
-	previewMaxFrames          = 40
-	previewPlaybackFps        = 20
-	previewBudgetMargin       = 0.99
+	// Planning budget for the preview's decoded size in Chatterino. The
+	// client rejects images decoding past 20MB of RAM (Image.hpp maxBytesRam);
+	// plan 2MB under that for safety.
+	previewMaxDecodedBytes = 18 * 1024 * 1024
+	previewShortEdgeCap    = 113
+	previewMinFrames       = 8
+	previewMaxFrames       = 256
+	previewPlaybackFps     = 20
+	previewBudgetMargin    = 0.99
 )
 
 func EnqueuePreviewJob(fileID string) {
@@ -523,7 +526,7 @@ func planDims(srcW, srcH int, scale float64) (int, int) {
 }
 
 func planFrames(pw, ph int) int {
-	frames := int(previewBudgetMargin * float64(chatterinoMaxDecodedBytes) / float64(pw*ph*4))
+	frames := int(previewBudgetMargin * float64(previewMaxDecodedBytes) / float64(pw*ph*4))
 	if frames > previewMaxFrames {
 		frames = previewMaxFrames
 	}
@@ -539,7 +542,7 @@ func previewPlan(srcW, srcH int) (float64, int) {
 	if short > previewShortEdgeCap {
 		scale = float64(previewShortEdgeCap) / float64(short)
 	}
-	maxFloorArea := previewBudgetMargin * float64(chatterinoMaxDecodedBytes) / (4.0 * float64(previewMinFrames))
+	maxFloorArea := previewBudgetMargin * float64(previewMaxDecodedBytes) / (4.0 * float64(previewMinFrames))
 	for attempt := 0; attempt < 64; attempt++ {
 		pw, ph := planDims(srcW, srcH, scale)
 		frames := planFrames(pw, ph)
@@ -597,7 +600,7 @@ func optimizeWebp(sourcePath, webpDir, baseName string) (string, error) {
 
 	// Byte-pressure shrinking is bounded relative to the planned scale: the
 	// plan itself may sit below an absolute floor for high-resolution sources
-	// (e.g. 270/1440 = 0.1875 for 1440p).
+	// (e.g. 113/1440 = 0.0785 for 1440p).
 	minScale := scale * 0.2
 
 	initQuality := 80

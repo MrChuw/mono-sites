@@ -20,15 +20,15 @@ func TestPreviewPlan(t *testing.T) {
 		wantScale  float64
 		wantFrames int
 	}{
-		{"1080p clamps to the bar", 1920, 1080, 270.0 / 1080.0, 40},
-		{"720p clamps to the bar", 1280, 720, 270.0 / 720.0, 40},
-		{"4k clamps to the bar", 3840, 2160, 270.0 / 2160.0, 40},
-		{"4:3 clamps to the bar", 1440, 1080, 270.0 / 1080.0, 40},
-		{"portrait clamps short edge", 1080, 1920, 270.0 / 1080.0, 40},
-		{"480p clamps to the bar", 854, 480, 270.0 / 480.0, 40},
-		{"360p clamps to the bar", 640, 360, 270.0 / 360.0, 40},
-		{"tiny source stays native", 320, 180, 1.0, 40},
-		{"odd dims scale to the bar", 1234, 567, 270.0 / 567.0, 32},
+		{"1080p clamps to the bar", 1920, 1080, 113.0 / 1080.0, 208},
+		{"720p clamps to the bar", 1280, 720, 113.0 / 720.0, 208},
+		{"4k clamps to the bar", 3840, 2160, 113.0 / 2160.0, 208},
+		{"4:3 clamps to the bar", 1440, 1080, 113.0 / 1080.0, 256},
+		{"portrait clamps short edge", 1080, 1920, 113.0 / 1080.0, 208},
+		{"480p clamps to the bar", 854, 480, 113.0 / 480.0, 208},
+		{"360p clamps to the bar", 640, 360, 113.0 / 360.0, 208},
+		{"tiny source stays native", 160, 90, 1.0, 256},
+		{"odd dims scale to the bar", 1234, 567, 113.0 / 567.0, 170},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,7 +40,7 @@ func TestPreviewPlan(t *testing.T) {
 				t.Fatalf("frames = %d, want %d", frames, tc.wantFrames)
 			}
 			pw, ph := planDims(tc.srcW, tc.srcH, scale)
-			if pw*ph*frames*4 > chatterinoMaxDecodedBytes {
+			if pw*ph*frames*4 > previewMaxDecodedBytes {
 				t.Fatalf("plan exceeds budget: %dx%d @ %d frames = %d bytes",
 					pw, ph, frames, pw*ph*frames*4)
 			}
@@ -62,15 +62,15 @@ func TestPreviewPlan(t *testing.T) {
 }
 
 func TestPreviewPlanFrameFloorTradesResolution(t *testing.T) {
-	scale, frames := previewPlan(5000, 450)
+	scale, frames := previewPlan(25000, 450)
 	if frames != previewMinFrames {
 		t.Fatalf("frames = %d, want %d", frames, previewMinFrames)
 	}
-	if scale >= 270.0/450.0 {
+	if scale >= 113.0/450.0 {
 		t.Fatalf("scale %v not reduced below the bar", scale)
 	}
 	pw, ph := planDims(5000, 450, scale)
-	if pw*ph*frames*4 > chatterinoMaxDecodedBytes {
+	if pw*ph*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("plan exceeds budget: %dx%d @ %d frames", pw, ph, frames)
 	}
 }
@@ -93,9 +93,9 @@ func TestPreviewPlanRespectsBudget(t *testing.T) {
 				d[0], d[1], frames, previewMinFrames, previewMaxFrames)
 		}
 		pw, ph := planDims(d[0], d[1], scale)
-		if pw*ph*frames*4 > chatterinoMaxDecodedBytes {
+		if pw*ph*frames*4 > previewMaxDecodedBytes {
 			t.Fatalf("%dx%d: plan %dx%d @ %d frames = %d bytes > %d",
-				d[0], d[1], pw, ph, frames, pw*ph*frames*4, chatterinoMaxDecodedBytes)
+				d[0], d[1], pw, ph, frames, pw*ph*frames*4, previewMaxDecodedBytes)
 		}
 	}
 }
@@ -168,13 +168,13 @@ func TestOptimizeWebpHDFitsChatterinoBudget(t *testing.T) {
 		t.Fatalf("optimizeWebp: %v", err)
 	}
 	w, h, frames := probeWebp(t, out)
-	if w != 480 || h != 270 {
-		t.Fatalf("preview dims %dx%d, want 480x270", w, h)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
 	}
-	if frames != 40 {
-		t.Fatalf("preview frames %d, want 40", frames)
+	if frames != 90 {
+		t.Fatalf("preview frames %d, want 90 (4.5s at 20fps)", frames)
 	}
-	if w*h*frames*4 > chatterinoMaxDecodedBytes {
+	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
 	if delay := webpFrameDelay(t, out); delay != 0.05 {
@@ -196,13 +196,13 @@ func TestOptimizeWebpShortVideoStaysRealTime(t *testing.T) {
 		t.Fatalf("optimizeWebp: %v", err)
 	}
 	w, h, frames := probeWebp(t, out)
-	if w != 480 || h != 270 {
-		t.Fatalf("preview dims %dx%d, want 480x270", w, h)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
 	}
 	if frames != 20 {
 		t.Fatalf("preview frames %d, want 20 (1s at 20fps)", frames)
 	}
-	if w*h*frames*4 > chatterinoMaxDecodedBytes {
+	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
 	if delay := webpFrameDelay(t, out); delay != 0.05 {
@@ -217,20 +217,20 @@ func TestOptimizeWebpSmallSourceStaysNative(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := filepath.Join(config.UploadDir, "clip.mp4")
-	generateTestVideo(t, source, "256x144", 4.5)
+	generateTestVideo(t, source, "160x90", 4.5)
 
 	out, err := optimizeWebp(source, webpDir, "clip")
 	if err != nil {
 		t.Fatalf("optimizeWebp: %v", err)
 	}
 	w, h, frames := probeWebp(t, out)
-	if w != 256 || h != 144 {
-		t.Fatalf("preview dims %dx%d, want 256x144", w, h)
+	if w != 160 || h != 90 {
+		t.Fatalf("preview dims %dx%d, want 160x90", w, h)
 	}
-	if frames != 40 {
-		t.Fatalf("preview frames %d, want 40", frames)
+	if frames != 90 {
+		t.Fatalf("preview frames %d, want 90 (4.5s at 20fps)", frames)
 	}
-	if w*h*frames*4 > chatterinoMaxDecodedBytes {
+	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
 	}
 }
@@ -244,20 +244,50 @@ func TestOptimizeWebp1440pPlanScaleBelowLegacyFloor(t *testing.T) {
 	source := filepath.Join(config.UploadDir, "clip.mp4")
 	generateTestVideo(t, source, "2560x1440", 4.5)
 
-	// The 1440p bar scale (270/1440 = 0.1875) sits below the byte-pressure
+	// The 1440p bar scale (113/1440 = 0.0785) sits below the byte-pressure
 	// shrink floor; the loop must still run at the planned scale.
 	out, err := optimizeWebp(source, webpDir, "clip")
 	if err != nil {
 		t.Fatalf("optimizeWebp: %v", err)
 	}
 	w, h, frames := probeWebp(t, out)
-	if w != 480 || h != 270 {
-		t.Fatalf("preview dims %dx%d, want 480x270", w, h)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
 	}
-	if frames != 40 {
-		t.Fatalf("preview frames %d, want 40", frames)
+	if frames != 90 {
+		t.Fatalf("preview frames %d, want 90 (4.5s at 20fps)", frames)
 	}
-	if w*h*frames*4 > chatterinoMaxDecodedBytes {
+	if w*h*frames*4 > previewMaxDecodedBytes {
 		t.Fatalf("preview exceeds chatterino budget")
+	}
+}
+
+func TestOptimizeWebpLongVideoSpendsBudgetOnFrames(t *testing.T) {
+	setupDirs(t)
+	webpDir := filepath.Join(config.ThumbDir, "w")
+	if err := os.MkdirAll(webpDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(config.UploadDir, "clip.mp4")
+	generateTestVideo(t, source, "1920x1080", 20.885)
+
+	// The reference feridinha file: long enough that the area budget, not the
+	// duration, binds — resolution is traded for a long, smooth loop.
+	out, err := optimizeWebp(source, webpDir, "clip")
+	if err != nil {
+		t.Fatalf("optimizeWebp: %v", err)
+	}
+	w, h, frames := probeWebp(t, out)
+	if w != 200 || h != 112 {
+		t.Fatalf("preview dims %dx%d, want 200x112", w, h)
+	}
+	if frames != 208 {
+		t.Fatalf("preview frames %d, want 208 (area budget at 18MB)", frames)
+	}
+	if w*h*frames*4 > previewMaxDecodedBytes {
+		t.Fatalf("preview exceeds chatterino budget")
+	}
+	if delay := webpFrameDelay(t, out); delay != 0.05 {
+		t.Fatalf("frame delay %v, want 0.05 (20fps playback)", delay)
 	}
 }
