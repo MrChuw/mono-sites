@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"html"
 	"mime"
@@ -55,14 +56,19 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 			return
 		}
 
+		isPreview := strings.Contains(r.URL.Path, "/preview/")
+
 		info, err := os.Stat(absFile)
 		if err != nil || info.IsDir() {
-			stats.RecordNotFound()
-			http.Error(w, "File not found", http.StatusNotFound)
-			return
+			if isPreview && waitForPreviewAsset(r.Context(), absFile) {
+				info, err = os.Stat(absFile)
+			}
+			if err != nil || info.IsDir() {
+				stats.RecordNotFound()
+				http.Error(w, "File not found", http.StatusNotFound)
+				return
+			}
 		}
-
-		isPreview := strings.Contains(r.URL.Path, "/preview/")
 
 		if !isPreview && isLinkResolver(r.Header.Get("User-Agent")) {
 			serveOpenGraph(w, r, fullPath, info)
@@ -71,7 +77,7 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 
 		etag := fmt.Sprintf(`"%d-%d"`, info.ModTime().Unix(), info.Size())
 
-		if strings.Contains(r.URL.Path, "/preview/") {
+		if isPreview {
 			w.Header().Set("Cache-Control", "public, max-age=0, must-revalidate")
 			w.Header().Set("Vary", "Origin")
 		} else {
@@ -118,6 +124,27 @@ func ServeFileHandler(client *bun.DB) http.HandlerFunc {
 
 		recordDelivery(r, isPreview, fullPath, mime, served)
 		http.ServeFile(w, r, absFile)
+	}
+}
+
+var previewWaitTimeout = 5 * time.Minute
+
+func waitForPreviewAsset(ctx context.Context, path string) bool {
+	deadline := time.Now().Add(previewWaitTimeout)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+		if fi, err := os.Stat(path); err == nil && !fi.IsDir() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
 	}
 }
 
@@ -223,31 +250,15 @@ func serveOpenGraph(w http.ResponseWriter, r *http.Request, fullPath string, inf
 		cleanPath = strings.SplitN(cleanPath, "uploads/", 2)[1]
 	}
 	webpURL := fmt.Sprintf("%s://%s/preview/w/%s.webp?chatterino", scheme, r.Host, baseName)
-	webpPath := filepath.Join(config.ThumbDir, "w", baseName+".webp")
 
 	isAnimatedSource := strings.HasPrefix(mimeType, "video/") ||
 		mimeType == "image/gif" || mimeType == "image/webp"
-	if isAnimatedSource {
-		if _, err := os.Stat(webpPath); err != nil {
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				time.Sleep(250 * time.Millisecond)
-				if _, err := os.Stat(webpPath); err == nil {
-					break
-				}
+	if !isAnimatedSource {
+		webpURL = fmt.Sprintf("%s://%s/preview/t/%s.jpg?chatterino", scheme, r.Host, baseName)
+		if _, err := os.Stat(filepath.Join(config.ThumbDir, "t", baseName+".jpg")); err != nil {
+			if _, err := os.Stat(filepath.Join(config.ThumbDir, "t", baseName+".png")); err == nil {
+				webpURL = fmt.Sprintf("%s://%s/preview/t/%s.png?chatterino", scheme, r.Host, baseName)
 			}
-		}
-	}
-
-	if _, err := os.Stat(webpPath); err != nil {
-		jpgPath := filepath.Join(config.ThumbDir, "t", baseName+".jpg")
-		pngPath := filepath.Join(config.ThumbDir, "t", baseName+".png")
-		if _, err := os.Stat(jpgPath); err == nil {
-			webpURL = fmt.Sprintf("%s://%s/preview/t/%s.jpg?chatterino", scheme, r.Host, baseName)
-		} else if _, err := os.Stat(pngPath); err == nil {
-			webpURL = fmt.Sprintf("%s://%s/preview/t/%s.png?chatterino", scheme, r.Host, baseName)
-		} else {
-			webpURL = ""
 		}
 	}
 

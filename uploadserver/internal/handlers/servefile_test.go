@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"uploadserver/internal/config"
 	"uploadserver/internal/stats"
@@ -172,4 +173,105 @@ func TestFaviconHandler(t *testing.T) {
 			t.Fatalf("body = %q, want the uploaded favicon", got)
 		}
 	})
+}
+
+func TestServePreviewWaitsForLateAsset(t *testing.T) {
+	client := setupService(t)
+	h := ServeFileHandler(client)
+
+	origTimeout := previewWaitTimeout
+	previewWaitTimeout = 5 * time.Second
+	t.Cleanup(func() { previewWaitTimeout = origTimeout })
+
+	config.ThumbDir = filepath.Join(config.UploadDir, "preview")
+
+	content := "late webp bytes"
+	previewPath := filepath.Join(config.ThumbDir, "w", "late123.webp")
+
+	start := time.Now()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "http://i.example.com/preview/w/late123.webp", nil)
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		done <- rec
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(previewPath); err == nil {
+		t.Fatal("preview asset must not exist before it is written late")
+	}
+	if err := os.MkdirAll(filepath.Dir(previewPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(previewPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := <-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 once the asset lands", rec.Code)
+	}
+	if got := rec.Body.String(); got != content {
+		t.Fatalf("body = %q, want the late asset", got)
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("served after %v, want the handler to hold for the late asset", elapsed)
+	}
+}
+
+func TestServePreviewMissingTimesOut(t *testing.T) {
+	client := setupService(t)
+	h := ServeFileHandler(client)
+
+	origTimeout := previewWaitTimeout
+	previewWaitTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { previewWaitTimeout = origTimeout })
+
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "http://i.example.com/preview/w/ghost123.webp", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404 once the wait window closes", rec.Code)
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Fatalf("404 after %v, want the hold to run at least one wait window", elapsed)
+	}
+
+	start = time.Now()
+	rec = httptest.NewRecorder()
+	h(rec, httptest.NewRequest(http.MethodGet, "http://i.example.com/ghost123.txt", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code = %d, want 404", rec.Code)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("non-preview 404 took %v, want immediate", elapsed)
+	}
+}
+
+func TestServeOpenGraphAlwaysSendsPreviewLink(t *testing.T) {
+	client := setupService(t)
+	h := ServeFileHandler(client)
+
+	seedServedFile(t, "vid123.webm", "fake video bytes")
+	seedServedFile(t, "pic123.png", "fake png bytes")
+
+	do := func(target string) string {
+		req := httptest.NewRequest(http.MethodGet, "http://i.example.com"+target, nil)
+		req.Header.Set("User-Agent", "chatterino-api-cache/1.0.0 link-resolver")
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %q: code = %d, want 200", target, rec.Code)
+		}
+		return rec.Body.String()
+	}
+
+	if body := do("/vid123.webm"); !strings.Contains(body, `property="og:image" content="http://i.example.com/preview/w/vid123.webp?chatterino"`) {
+		t.Fatalf("og:image should point at the webp preview: %q", body)
+	}
+
+	if body := do("/pic123.png"); !strings.Contains(body, `content="http://i.example.com/preview/t/pic123.jpg?chatterino"`) {
+		t.Fatalf("og:image should point at the thumbnail: %q", body)
+	}
 }

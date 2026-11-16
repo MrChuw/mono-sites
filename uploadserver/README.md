@@ -8,6 +8,8 @@ Files that can't have a real preview (text, archives, binaries, ...) get a squar
 
 Videos get a static JPEG frame thumbnail, an animated GIF preview (`/preview/p/`), and an animated WebP preview (`/preview/w/`) capped at ~3.9 MB. Animated image uploads (GIF/WebP files) also get an animated WebP preview, so link resolvers (e.g. the Chatterino link resolver, which receives the preview through `og:image`) can show them moving.
 
+Previews are generated asynchronously after the upload response is already out, so preview links are always sent up front. A request for a preview that doesn't exist yet just holds the connection open until the asset lands (it 404s if it never shows up).
+
 ## Endpoints
 
 | Endpoint                  | Description                             |
